@@ -3,6 +3,7 @@
 Built for the **Heads Up: Even Realities Hackathon** targeting **Track 02 (Crypto & DeFi)**, **Special Prize (Best Telegram Integration)**, and **Grand Prize**.
 
 - **Live Browser G2 Optical Simulator**: https://lhortl.github.io/glancepulse-g2/
+- **HD Demo Walkthrough Video (75s, 1280×720)**: https://github.com/LHorTL/glancepulse-g2/releases/download/v2.0.0/glancepulse-v2-demo.mp4
 - **Pre-Built EvenHub `.ehpk` Package (v2.0.0)**: https://github.com/LHorTL/glancepulse-g2/releases/tag/v2.0.0 (`min_app_version 2.2.10`, SDK `0.0.16`)
 
 ![GlancePulse v2.0 G2 Optical Waveguide HUD](./assets/preview-hud.png)
