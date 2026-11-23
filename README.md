@@ -2,6 +2,9 @@
 
 Built for the **Heads Up: Even Realities Hackathon** targeting **Track 02 (Crypto & DeFi)** and **Special Prize (Best Telegram Integration)**.
 
+- **Live Browser G2 Optical Simulator**: https://lhortl.github.io/glancepulse-g2/
+- **Pre-Built EvenHub `.ehpk` Package (v1.0.0)**: https://github.com/LHorTL/glancepulse-g2/releases/tag/v1.0.0
+
 ![GlancePulse G2 Optical Waveguide HUD](./assets/preview-hud.png)
 
 GlancePulse turns Even Realities G2 smart glasses (`576×288` monochrome waveguide optics) into a glanceable, hands-free **Read + Write** trading and messaging HUD:
