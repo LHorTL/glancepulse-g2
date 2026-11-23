@@ -1,0 +1,263 @@
+:root {
+  --bg: #070b09;
+  --surface: #0e1612;
+  --surface-2: #13201a;
+  --border: #1e372a;
+  --text: #e6f5ec;
+  --muted: #84a895;
+  --g2-green: #39ff9c;
+  --g2-dim: #1c7c4e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at top left, #0c1d15 0%, var(--bg) 55%);
+  color: var(--text);
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.mono {
+  font-family: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+}
+
+.shell {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 20px 22px 32px;
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.02em;
+}
+
+.topbar .sub {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--g2-green);
+  margin-left: 8px;
+}
+
+.tagline {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pill {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.pill-live {
+  border-color: rgba(57, 255, 156, 0.55);
+  color: var(--g2-green);
+  background: rgba(57, 255, 156, 0.08);
+}
+
+.pill-sim,
+.pill-demo {
+  color: #a9d5be;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: minmax(580px, 1.35fr) minmax(300px, 0.9fr);
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.glasses-panel,
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.frame-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.tab-bar {
+  display: flex;
+  gap: 6px;
+}
+
+.tab-btn {
+  background: var(--surface-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tab-btn.active {
+  color: #03150b;
+  background: var(--g2-green);
+  border-color: var(--g2-green);
+}
+
+.waveguide-bezel {
+  background: #010402;
+  border: 2px solid #214533;
+  border-radius: 12px;
+  padding: 14px;
+  box-shadow: 0 0 36px rgba(57, 255, 156, 0.12), inset 0 0 24px rgba(57, 255, 156, 0.06);
+  display: flex;
+  justify-content: center;
+}
+
+#g2-canvas {
+  width: 100%;
+  max-width: 576px;
+  height: auto;
+  aspect-ratio: 2 / 1;
+  border-radius: 6px;
+  display: block;
+}
+
+.gesture-deck {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.g-btn {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.g-btn:hover {
+  border-color: var(--g2-green);
+}
+
+.g-primary {
+  background: rgba(57, 255, 156, 0.16);
+  border-color: rgba(57, 255, 156, 0.65);
+  color: var(--g2-green);
+}
+
+.companion-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.card h2 {
+  margin: 0 0 8px;
+  font-size: 14.5px;
+  color: var(--g2-green);
+}
+
+.hint {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field input {
+  background: #080f0b;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.outbox {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.outbox .muted {
+  color: var(--muted);
+}
+
+.wire-log {
+  margin: 0;
+  padding: 10px;
+  background: #050a07;
+  border: 1px solid #162a20;
+  border-radius: 8px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #8ee5b6;
+  max-height: 170px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
