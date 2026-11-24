@@ -10,16 +10,22 @@ import {
   FALLBACK_CANDLES,
   FALLBACK_HYPERLIQUID,
   FALLBACK_POLYMARKET,
+  HYPERLIQUID_ENDPOINTS,
+  PRESET_WALLETS,
   buildPulseSummaryText,
   buildSmartReplies,
   encodeTelegramBotToken,
   evaluateAlerts,
   extractMarketContext,
   fetchHyperliquidCandles,
+  fetchHyperliquidWallet,
   fetchTelegramInbox,
+  isValidEvmAddress,
   mergeInboxMessages,
+  parseClearinghouseState,
   parseHyperliquidResponse,
   parsePolymarketResponse,
+  resolveHyperliquidUrl,
   resolveTelegramBaseUrl,
   sendTelegramMessage,
 } from "../src/feeds.js";
@@ -37,10 +43,11 @@ import {
   buildHeaderUpgrade,
   buildImageUpdate,
   buildKpiUpgrade,
+  buildWalletListEntries,
   deriveToastHeading,
 } from "../src/g2-layout.js";
 import { parseTelegramProxyPath } from "../proxy/cloudflare-worker.js";
-import { getControllerState, handleSdkEvent } from "../src/main.js";
+import { getControllerState, handleSdkEvent, submitVoiceCommandText } from "../src/main.js";
 import {
   SPARK_IMG_HEIGHT,
   SPARK_IMG_WIDTH,
@@ -54,6 +61,13 @@ import {
   computePcm16Rms,
   normalizeEvenHubListEvent,
 } from "../src/imu-gesture.js";
+import {
+  closePaperPosition,
+  computePaperPortfolioMetrics,
+  createDefaultPaperBook,
+  executePaperIntent,
+  parseVoiceTradeIntent,
+} from "../src/trading.js";
 
 function makeBaseState(overrides = {}) {
   return {
@@ -91,7 +105,7 @@ function boxesOverlap(a, b) {
   );
 }
 
-test("1. All 4 G2 screens + voice/confirm states produce protocol-valid, non-overlapping 6-container pages", () => {
+test("1. All 5 G2 screens + voice/confirm states produce protocol-valid, non-overlapping 6-container pages", () => {
   const scenarios = [
     ...SCREENS.map((screen) => makeBaseState({ screen })),
     makeBaseState({ screen: "FOCUS", voiceRecording: true, voiceTranscript: "Trim half SOL perp now and arm alert" }),
@@ -519,12 +533,15 @@ test("14. Toast headings reflect ERROR, CANCELED, NOTICE, and CONFIRMED accurate
   assert.ok(cancelDetail.startsWith("CANCELED\n"));
 });
 
-test("15. MINI_FONT renders J, Q, Z glyphs into grayscale image buffer", () => {
+test("15. MINI_FONT renders J, Q, Z, $, and / glyphs into grayscale image buffer", () => {
   const blank = renderSparklineImage([], { tag: "   " });
   const jqz = renderSparklineImage([], { tag: "JQZ" });
+  const usdSlash = renderSparklineImage([], { tag: "$/+" });
   const litBlank = blank.pixels.filter((v) => v > 150).length;
   const litJqz = jqz.pixels.filter((v) => v > 150).length;
+  const litUsd = usdSlash.pixels.filter((v) => v > 150).length;
   assert.ok(litJqz > litBlank + 20, `Expected J, Q, Z pixels to render (blank=${litBlank}, jqz=${litJqz})`);
+  assert.ok(litUsd > litBlank + 12, `Expected $, / pixels to render (blank=${litBlank}, usdSlash=${litUsd})`);
 });
 
 test("16. FOREGROUND_EXIT_EVENT aborts active recording cleanly without drafting reply or arming IMU, and proto3 sysEvent CLICK works", async () => {
@@ -572,4 +589,354 @@ test("16. FOREGROUND_EXIT_EVENT aborts active recording cleanly without drafting
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(st.voiceRecording, false);
 });
+
+test("17. Hyperliquid clearinghouseState parser & wallet fetcher handle mainnet/testnet, sorting, invalid addresses, and honest error fallback", async () => {
+  assert.equal(resolveHyperliquidUrl("mainnet"), HYPERLIQUID_ENDPOINTS.mainnet);
+  assert.equal(resolveHyperliquidUrl("testnet"), HYPERLIQUID_ENDPOINTS.testnet);
+  assert.equal(isValidEvmAddress(PRESET_WALLETS.mainnet.address), true);
+  assert.equal(isValidEvmAddress("0x1234"), false);
+
+  const sampleRaw = {
+    marginSummary: {
+      accountValue: "3171586.24",
+      totalNtlPos: "2776518.00",
+      totalMarginUsed: "138825.90",
+    },
+    withdrawable: "2893934.43",
+    assetPositions: [
+      {
+        type: "oneWay",
+        position: {
+          coin: "BTC",
+          szi: "-0.05358",
+          leverage: { type: "cross", value: 20 },
+          entryPx: "60015.8",
+          positionValue: "3203.82",
+          unrealizedPnl: "11.83",
+          returnOnEquity: "0.0736",
+          marginUsed: "160.19",
+          liquidationPx: "58154123.3",
+        },
+      },
+      {
+        type: "oneWay",
+        position: {
+          coin: "ETH",
+          szi: "4.5",
+          leverage: { type: "cross", value: 10 },
+          entryPx: "3200.0",
+          positionValue: "15300.0",
+          unrealizedPnl: "420.55",
+          returnOnEquity: "0.275",
+          marginUsed: "1530.0",
+          liquidationPx: "2800.0",
+        },
+      },
+      {
+        type: "oneWay",
+        position: { coin: "ZERO", szi: "0", positionValue: "0", unrealizedPnl: "0" },
+      },
+    ],
+  };
+
+  const parsed = parseClearinghouseState(sampleRaw, {
+    address: PRESET_WALLETS.mainnet.address,
+    network: "mainnet",
+  });
+  assert.equal(parsed.totalPositionCount, 2);
+  assert.equal(parsed.positions[0].coin, "ETH"); // sorted by notional descending
+  assert.equal(parsed.positions[0].side, "LONG");
+  assert.equal(parsed.positions[1].coin, "BTC");
+  assert.equal(parsed.positions[1].side, "SHORT");
+  assert.equal(parsed.totalUnrealizedPnl, 432.38);
+  assert.equal(parsed.marginRatioPct, 4.4);
+
+  // Live testnet fetcher routes to hyperliquid-testnet URL with clearinghouseState body
+  let calledUrl = "";
+  let calledBody = null;
+  const liveTestnet = await fetchHyperliquidWallet(
+    { address: PRESET_WALLETS.testnet.address, network: "testnet" },
+    async (url, opts) => {
+      calledUrl = url;
+      calledBody = JSON.parse(opts.body);
+      return { ok: true, json: async () => sampleRaw };
+    }
+  );
+  assert.equal(calledUrl, HYPERLIQUID_ENDPOINTS.testnet);
+  assert.equal(calledBody.type, "clearinghouseState");
+  assert.equal(calledBody.user, PRESET_WALLETS.testnet.address);
+  assert.equal(liveTestnet.source, "LIVE");
+  assert.equal(liveTestnet.wallet.network, "testnet");
+
+  // Invalid address returns INVALID with null wallet (zero fake data)
+  const invalidRes = await fetchHyperliquidWallet({ address: "not-an-address", network: "mainnet" });
+  assert.equal(invalidRes.source, "INVALID");
+  assert.equal(invalidRes.wallet, null);
+
+  // Network failure returns honest ERROR with null wallet (zero fabricated positions)
+  const errRes = await fetchHyperliquidWallet(
+    { address: PRESET_WALLETS.mainnet.address, network: "mainnet" },
+    async () => {
+      throw new Error("timeout");
+    }
+  );
+  assert.equal(errRes.source, "ERROR");
+  assert.equal(errRes.wallet, null);
+});
+
+test("18. Voice command intent parser handles paper perp orders, Polymarket paper bets, and passes Telegram replies cleanly", () => {
+  const ctx = { perps: FALLBACK_HYPERLIQUID, markets: FALLBACK_POLYMARKET };
+
+  const longBtc = parseVoiceTradeIntent("Long BTC 100", ctx);
+  assert.equal(longBtc?.kind, "PAPER_PERP");
+  assert.equal(longBtc.side, "LONG");
+  assert.equal(longBtc.coin, "BTC");
+  assert.equal(longBtc.sizeUsd, 100);
+  assert.equal(longBtc.leverage, 3);
+  assert.equal(longBtc.entryPx, FALLBACK_HYPERLIQUID[0].markPx);
+
+  const shortEth = parseVoiceTradeIntent("Short ETH $250 5x", ctx);
+  assert.equal(shortEth?.kind, "PAPER_PERP");
+  assert.equal(shortEth.side, "SHORT");
+  assert.equal(shortEth.coin, "ETH");
+  assert.equal(shortEth.sizeUsd, 250);
+  assert.equal(shortEth.leverage, 5);
+  assert.equal(shortEth.marginUsd, 50);
+
+  const reversedOrder = parseVoiceTradeIntent("Buy $150 SOL", ctx);
+  assert.equal(reversedOrder?.kind, "PAPER_PERP");
+  assert.equal(reversedOrder.side, "LONG");
+  assert.equal(reversedOrder.coin, "SOL");
+  assert.equal(reversedOrder.sizeUsd, 150);
+
+  const betFed = parseVoiceTradeIntent("Bet Yes 50 on Fed", ctx);
+  assert.equal(betFed?.kind, "PAPER_BET");
+  assert.equal(betFed.outcome, "YES");
+  assert.equal(betFed.stakeUsd, 50);
+  assert.equal(betFed.marketId, "pm-fed-dec");
+  assert.equal(betFed.entryOddsPct, 68);
+  assert.ok(betFed.maxPayoutUsd > 73 && betFed.maxPayoutUsd < 74);
+
+  const betNoBtc = parseVoiceTradeIntent("Bet $25 No on Bitcoin", ctx);
+  assert.equal(betNoBtc?.kind, "PAPER_BET");
+  assert.equal(betNoBtc.outcome, "NO");
+  assert.equal(betNoBtc.stakeUsd, 25);
+  assert.equal(betNoBtc.marketId, "pm-btc-100k");
+  assert.equal(betNoBtc.entryOddsPct, 46);
+
+  // Regular Telegram conversational reply must return null (falls through to Telegram draft)
+  assert.equal(parseVoiceTradeIntent("Trim half SOL now, arm 2% alert", ctx), null);
+  assert.equal(parseVoiceTradeIntent("Back at desk in 5m, keep hedge on", ctx), null);
+});
+
+test("19. Non-custodial paper order/bet execution tracks live mark-to-market uPnL, guards cash, and realizes PnL on close", () => {
+  let book = createDefaultPaperBook(1000);
+  const perpsT0 = [
+    { coin: "BTC", markPx: 100000, change24h: 1.0, fundingApr: 10, openInterestUsd: 1e9 },
+    { coin: "ETH", markPx: 3000, change24h: 0.5, fundingApr: 10, openInterestUsd: 5e8 },
+  ];
+  const marketsT0 = [
+    { id: "pm-fed-dec", question: "No change in Fed rates after next FOMC?", yesPct: 50, volume24h: 5e6, deltaPct: 1 },
+  ];
+
+  // Open LONG BTC $300 3x ($100 margin) + BET YES $100 @50% (200 shares)
+  const btcIntent = parseVoiceTradeIntent("Long BTC 300 3x", { perps: perpsT0, markets: marketsT0 });
+  const r1 = executePaperIntent(book, btcIntent, 1000);
+  assert.equal(r1.ok, true);
+  book = r1.book;
+  assert.equal(book.cashUsd, 900);
+
+  const betIntent = parseVoiceTradeIntent("Bet Yes 100 on Fed", { perps: perpsT0, markets: marketsT0 });
+  const r2 = executePaperIntent(book, betIntent, 2000);
+  assert.equal(r2.ok, true);
+  book = r2.book;
+  assert.equal(book.cashUsd, 800);
+
+  // Insufficient cash guard
+  const tooBig = parseVoiceTradeIntent("Long BTC 9000 1x", { perps: perpsT0, markets: marketsT0 });
+  const rErr = executePaperIntent(book, tooBig, 2500);
+  assert.equal(rErr.ok, false);
+  assert.match(rErr.error, /Insufficient paper cash/);
+
+  // Live prices move: BTC +10% -> $110,000 (+$30 uPnL on $300 notional), Fed YES 50% -> 65% (+$30 uPnL on 200 shares)
+  const perpsT1 = [{ ...perpsT0[0], markPx: 110000 }, perpsT0[1]];
+  const marketsT1 = [{ ...marketsT0[0], yesPct: 65 }];
+  const metrics = computePaperPortfolioMetrics(book, { perps: perpsT1, markets: marketsT1 });
+  assert.equal(metrics.perps[0].uPnlUsd, 30);
+  assert.equal(metrics.bets[0].uPnlUsd, 30);
+  assert.equal(metrics.unrealizedPnlUsd, 60);
+  assert.equal(metrics.totalEquityUsd, 1060);
+
+  // Close perp -> realizes +$30 and returns $130 to cash
+  const c1 = closePaperPosition(book, r1.record.id, { perps: perpsT1, markets: marketsT1 }, 3000);
+  assert.equal(c1.ok, true);
+  assert.equal(c1.realizedPnlUsd, 30);
+  assert.equal(c1.book.cashUsd, 930);
+  assert.equal(c1.book.realizedPnlUsd, 30);
+  assert.equal(c1.book.perpOrders.length, 0);
+});
+
+test("20. WALLET screen (incl. 6 HL positions & NO-bet fallback) and pending Order/Bet tickets obey strict G2 <=26x3 budgets", () => {
+  const coins = ["BTC", "ETH", "SOL", "HYPE", "SUI", "ARB"];
+  const wallet = parseClearinghouseState(
+    {
+      marginSummary: { accountValue: "3171586.24", totalNtlPos: "2776518.00", totalMarginUsed: "138825.90" },
+      withdrawable: "2893934.43",
+      assetPositions: coins.map((coin, i) => ({
+        type: "oneWay",
+        position: {
+          coin,
+          szi: i % 2 === 0 ? "-0.5" : "2.0",
+          leverage: { type: "cross", value: 20 },
+          entryPx: "1000",
+          positionValue: String(60000 - i * 5000),
+          unrealizedPnl: String(420 - i * 50),
+          returnOnEquity: "0.176",
+          marginUsed: "2375",
+        },
+      })),
+    },
+    { address: PRESET_WALLETS.mainnet.address, network: "mainnet" }
+  );
+
+  let book = createDefaultPaperBook(10000);
+  const perpIntent = parseVoiceTradeIntent("Long BTC 100", { perps: FALLBACK_HYPERLIQUID, markets: FALLBACK_POLYMARKET });
+  const betIntent = parseVoiceTradeIntent("Bet Yes 50 on Fed", { perps: FALLBACK_HYPERLIQUID, markets: FALLBACK_POLYMARKET });
+  const noBetIntent = parseVoiceTradeIntent("Bet No 40 on Fed", { perps: FALLBACK_HYPERLIQUID, markets: FALLBACK_POLYMARKET });
+  book = executePaperIntent(book, perpIntent, 1000).book;
+  book = executePaperIntent(book, betIntent, 2000).book;
+
+  const scenarios = [
+    makeBaseState({ screen: "WALLET", walletSource: "LIVE", walletData: wallet, paperBook: book, selectedIndex: 0 }),
+    makeBaseState({ screen: "WALLET", walletSource: "LIVE", walletData: wallet, paperBook: book, selectedIndex: 1 }),
+    makeBaseState({ screen: "WALLET", walletSource: "LIVE", walletData: wallet, paperBook: book, selectedIndex: 2 }),
+    makeBaseState({ screen: "WALLET", walletSource: "LIVE", walletData: wallet, paperBook: book, selectedIndex: 8 }), // 6th HL pos (ARB)
+    makeBaseState({ screen: "WALLET", walletSource: "ERROR", walletData: null, walletError: "Hyperliquid HTTP 503", paperBook: book }),
+    makeBaseState({ screen: "FOCUS", pendingTrade: perpIntent, imuActive: true }),
+    makeBaseState({ screen: "MARKETS", pendingTrade: betIntent, imuActive: true }),
+  ];
+
+  // All 6 HL positions must map cleanly into WALLET list entries (matches companion table's 6 rows)
+  const entries = buildWalletListEntries(scenarios[0]);
+  assert.ok(entries.some((e) => e.kind === "HL_POS" && e.item?.coin === "ARB"), "Expected 6th HL position (ARB) in G2 WALLET list");
+
+  for (const st of scenarios) {
+    const page = buildG2PagePayload(st, { isStartup: false });
+    assert.equal(validateEvenHubPageContainer(page).valid, true);
+
+    const hdr = buildHeaderUpgrade(st);
+    const det = buildDetailUpgrade(st);
+    const kpi = buildKpiUpgrade(st);
+    const ftr = buildFooterUpgrade(st);
+    const listItems = page.listObject[0].itemContainer.itemName;
+
+    assert.ok(hdr.content.length <= G2_TEXT_LIMITS.HEADER_CHARS, `Header too wide: ${hdr.content}`);
+    const detLines = det.content.split("\n");
+    assert.ok(detLines.length <= G2_TEXT_LIMITS.CARD_MAX_LINES, `Detail too tall: ${det.content}`);
+    for (const l of detLines) {
+      assert.ok(l.length <= G2_TEXT_LIMITS.CARD_LINE_CHARS, `Detail line too wide (${l.length}): ${l}`);
+    }
+    assert.ok(kpi.content.length <= G2_TEXT_LIMITS.KPI_CHARS, `KPI too wide: ${kpi.content}`);
+    assert.ok(ftr.content.length <= G2_TEXT_LIMITS.FOOTER_CHARS, `Footer too wide: ${ftr.content}`);
+    for (const item of listItems) {
+      assert.ok(item.length <= G2_TEXT_LIMITS.LIST_ITEM_CHARS, `List row too wide: ${item}`);
+    }
+  }
+
+  // Pending perp order displays sparkline; pending Polymarket bet displays probability gauge
+  assert.equal(buildGraphicForState(scenarios[5]).kind, "sparkline");
+  assert.equal(buildGraphicForState(scenarios[6]).kind, "probability");
+
+  // NO-bet graphic fallback when live market is absent must render YES% (68%), NOT inverted NO% (32%)
+  const noBook = executePaperIntent(createDefaultPaperBook(10000), noBetIntent, 3000).book;
+  const noStateOffline = makeBaseState({
+    screen: "WALLET",
+    markets: [],
+    paperBook: noBook,
+    selectedIndex: 1, // PAPER_BET row
+  });
+  const gNoFallback = buildGraphicForState(noStateOffline);
+  const gExpectedYes68 = renderProbabilityBarImage(68, { deltaText: "+$0.00" });
+  const gWrongYes32 = renderProbabilityBarImage(32, { deltaText: "+$0.00" });
+  assert.deepEqual(Array.from(gNoFallback.pixels), Array.from(gExpectedYes68.pixels));
+  assert.notDeepEqual(Array.from(gNoFallback.pixels), Array.from(gWrongYes32.pixels));
+});
+
+test("21. Controller voice-trade -> IMU Head-Nod dynamically selects newly filled perp & bet rows, IMU Head-Shake & 2xTap cancel cleanly", async () => {
+  const st = getControllerState();
+  st.paperBook = createDefaultPaperBook(10000);
+  st.pendingTrade = null;
+  st.pendingReply = null;
+  st.imuActive = false;
+
+  // Draft paper perp order via voice command router
+  const drafted = await submitVoiceCommandText("Long BTC 100");
+  assert.equal(drafted?.kind, "PAPER_PERP");
+  assert.equal(st.pendingTrade?.coin, "BTC");
+  assert.equal(st.imuActive, true);
+
+  // Confirm via IMU Head-Nod burst through official handleSdkEvent pipeline
+  for (const frame of buildSyntheticImuBurst("NOD", Date.now())) {
+    handleSdkEvent({
+      sysEvent: { eventType: OsEventTypeList.IMU_DATA_REPORT, imuData: frame },
+    });
+  }
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(st.pendingTrade, null);
+  assert.equal(st.imuActive, false);
+  assert.equal(st.paperBook.perpOrders.length, 1);
+  assert.equal(st.paperBook.perpOrders[0].coin, "BTC");
+  assert.equal(st.screen, "WALLET");
+  assert.equal(st.selectedIndex, 1); // Row 1 = newly created PAPER_PERP
+
+  // Draft Polymarket bet while PAPER_PERP already exists -> IMU Nod must dynamically highlight PAPER_BET (Row 2) + probability gauge!
+  const betExecDraft = await submitVoiceCommandText("Bet Yes 50 on Fed");
+  assert.equal(betExecDraft?.kind, "PAPER_BET");
+  for (const frame of buildSyntheticImuBurst("NOD", Date.now())) {
+    handleSdkEvent({
+      sysEvent: { eventType: OsEventTypeList.IMU_DATA_REPORT, imuData: frame },
+    });
+  }
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(st.paperBook.polyBets.length, 1);
+  assert.equal(st.screen, "WALLET");
+  const entriesAfterBet = buildWalletListEntries(st);
+  assert.equal(entriesAfterBet[st.selectedIndex]?.kind, "PAPER_BET");
+  assert.equal(entriesAfterBet[st.selectedIndex]?.item?.id, st.paperBook.polyBets[0].id);
+  assert.equal(buildGraphicForState(st).kind, "probability");
+
+  // Draft another Polymarket bet then cancel via real IMU Head-Shake burst through handleSdkEvent
+  const betDraft = await submitVoiceCommandText("Bet No 25 on Bitcoin");
+  assert.equal(betDraft?.kind, "PAPER_BET");
+  assert.equal(st.pendingTrade?.outcome, "NO");
+  assert.equal(st.imuActive, true);
+
+  for (const frame of buildSyntheticImuBurst("SHAKE", Date.now())) {
+    handleSdkEvent({
+      sysEvent: { eventType: OsEventTypeList.IMU_DATA_REPORT, imuData: frame },
+    });
+  }
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(st.pendingTrade, null);
+  assert.equal(st.imuActive, false);
+  assert.equal(st.paperBook.polyBets.length, 1);
+
+  // Also verify DOUBLE_CLICK_EVENT cancels a pending trade cleanly
+  await submitVoiceCommandText("Short ETH 250");
+  assert.equal(st.pendingTrade?.coin, "ETH");
+  handleSdkEvent({
+    sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT },
+  });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(st.pendingTrade, null);
+  assert.equal(st.imuActive, false);
+  assert.equal(st.paperBook.perpOrders.length, 1);
+
+  // Clear toast timer so node:test exits cleanly
+  if (st.toastTimer) {
+    clearTimeout(st.toastTimer);
+    st.toastTimer = null;
+  }
+});
+
 

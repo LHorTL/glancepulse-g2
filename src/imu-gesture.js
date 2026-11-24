@@ -102,6 +102,7 @@ export class ImuGestureDetector {
 
   reset() {
     this.samples = [];
+    this.lastTriggerMs = -Infinity;
   }
 
   /**

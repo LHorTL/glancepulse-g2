@@ -2,23 +2,24 @@
   "package_id": "io.glancepulse.g2",
   "edition": "202601",
   "name": "GlancePulse",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "min_app_version": "2.2.10",
   "min_sdk_version": "0.0.16",
   "entrypoint": "index.html",
   "permissions": [
     {
       "name": "network",
-      "desc": "Fetch live Hyperliquid perpetuals and 24h candles, Polymarket prediction odds, and sync threaded Telegram Bot/Channel messages and replies.",
+      "desc": "Fetch live Hyperliquid mainnet/testnet perpetuals, 24h candles, and read-only wallet positions (clearinghouseState), Polymarket prediction odds, and sync threaded Telegram Bot/Channel messages and replies.",
       "whitelist": [
         "https://gamma-api.polymarket.com",
         "https://api.hyperliquid.xyz",
+        "https://api.hyperliquid-testnet.xyz",
         "https://api.telegram.org"
       ]
     },
     {
       "name": "g2-microphone",
-      "desc": "Capture hands-free voice replies from Even G2 microphones while holding the temple touchpad or R1 ring."
+      "desc": "Capture hands-free voice orders, paper bets, and Telegram replies from Even G2 microphones while holding the temple touchpad or R1 ring."
     }
   ],
   "supported_languages": [

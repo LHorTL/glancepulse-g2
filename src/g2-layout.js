@@ -1,5 +1,5 @@
 /**
- * Even Realities G2 576x288 Focus-Card HUD Page Builder (v2.0).
+ * Even Realities G2 576x288 Focus-Card HUD Page Builder (v2.1).
  *
  * Strictly engineered for physical Even G2 waveguide hardware & LVGL firmware:
  *   - Canvas: 576 x 288 px (4-bit monochrome green micro-LED)
@@ -43,11 +43,15 @@ import {
   renderProbabilityBarImage,
   renderSparklineImage,
 } from "./graphics.js";
+import {
+  computePaperPortfolioMetrics,
+  formatSignedUsd,
+} from "./trading.js";
 
 export const G2_WIDTH = 576;
 export const G2_HEIGHT = 288;
 
-export const SCREENS = ["FOCUS", "PERPS", "MARKETS", "VOICE"];
+export const SCREENS = ["FOCUS", "WALLET", "PERPS", "MARKETS", "VOICE"];
 
 export const CONTAINER_IDS = {
   HEADER: 1,
@@ -77,13 +81,15 @@ export const MENU_ACTION_IDS = {
   ARM_ALERT: 107,
   SEND_PULSE_TG: 108,
   REFRESH_FEEDS: 109,
+  SCREEN_WALLET: 110,
 };
 
 export function buildContextMenu() {
   return new MenuContainerProperty({
     menuItems: [
       new MenuItemProperty({ itemID: MENU_ACTION_IDS.SCREEN_FOCUS, itemName: "Focus Card" }),
-      new MenuItemProperty({ itemID: MENU_ACTION_IDS.SCREEN_VOICE, itemName: "Voice Reply" }),
+      new MenuItemProperty({ itemID: MENU_ACTION_IDS.SCREEN_WALLET, itemName: "Wallet & Paper" }),
+      new MenuItemProperty({ itemID: MENU_ACTION_IDS.SCREEN_VOICE, itemName: "Voice Cmd/Reply" }),
       new MenuItemProperty({ itemID: MENU_ACTION_IDS.SCREEN_PERPS, itemName: "Hyperliquid Perps" }),
       new MenuItemProperty({ itemID: MENU_ACTION_IDS.SCREEN_MARKETS, itemName: "Polymarket Odds" }),
       new MenuItemProperty({ itemID: MENU_ACTION_IDS.NEXT_MSG, itemName: "Next Telegram Msg" }),
@@ -145,6 +151,89 @@ export function getFocusContext(state) {
   });
 }
 
+/**
+ * Structured rows rendered on the G2 `WALLET` screen (shared between layout and tap handlers).
+ */
+export function buildWalletListEntries(state) {
+  const entries = [];
+  const w = state?.walletData;
+  const netTag = state?.hlNetwork === "testnet" ? "TEST" : "MAIN";
+  const paper = computePaperPortfolioMetrics(state?.paperBook, {
+    perps: state?.perps || [],
+    markets: state?.markets || [],
+  });
+
+  if (w) {
+    const wNet = w.network === "testnet" ? "TEST" : "MAIN";
+    entries.push({
+      kind: "SUMMARY",
+      wallet: w,
+      paper,
+      label: truncateAscii(
+        `HL ${wNet} Eq:${formatCompactUsd(w.accountValue)} (${w.totalPositionCount} pos)`,
+        G2_TEXT_LIMITS.LIST_ITEM_CHARS
+      ),
+    });
+  } else {
+    const statusLabel =
+      state?.walletSource === "ERROR"
+        ? "Sync Err"
+        : state?.walletSource === "LOADING"
+          ? "Syncing..."
+          : "Tap Sync";
+    entries.push({
+      kind: "SUMMARY",
+      wallet: null,
+      paper,
+      label: truncateAscii(
+        `HL ${netTag} Wallet: ${statusLabel} | P:${formatCompactUsd(paper.totalEquityUsd)}`,
+        G2_TEXT_LIMITS.LIST_ITEM_CHARS
+      ),
+    });
+  }
+
+  for (const p of paper.perps.slice(0, 3)) {
+    entries.push({
+      kind: "PAPER_PERP",
+      item: p,
+      label: truncateAscii(
+        `[P] ${p.side === "LONG" ? "L" : "S"} ${p.coin} $${p.sizeUsd} ${formatSignedUsd(p.uPnlUsd, { compact: true })}`,
+        G2_TEXT_LIMITS.LIST_ITEM_CHARS
+      ),
+    });
+  }
+
+  for (const b of paper.bets.slice(0, 2)) {
+    entries.push({
+      kind: "PAPER_BET",
+      item: b,
+      label: truncateAscii(
+        `[P] ${b.outcome} $${b.stakeUsd} @${b.currentOddsPct}% ${formatSignedUsd(b.uPnlUsd, { compact: true })}`,
+        G2_TEXT_LIMITS.LIST_ITEM_CHARS
+      ),
+    });
+  }
+
+  const hlPositions = w?.positions || [];
+  for (const pos of hlPositions.slice(0, 6)) {
+    entries.push({
+      kind: "HL_POS",
+      item: pos,
+      label: truncateAscii(
+        `[HL] ${pos.coin} ${pos.side === "LONG" ? "L" : "S"} ${formatCompactUsd(pos.positionValue)} ${formatSignedUsd(pos.unrealizedPnl, { compact: true })}`,
+        G2_TEXT_LIMITS.LIST_ITEM_CHARS
+      ),
+    });
+  }
+
+  entries.push({
+    kind: "VOICE_TRADE",
+    label: truncateAscii("Voice Trade: Long/Short/Bet", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
+  });
+
+  return entries;
+}
+
 export function formatHeaderLine(state) {
   const now = new Date(state.nowMs || Date.now());
   const hh = String(now.getHours()).padStart(2, "0");
@@ -157,14 +246,31 @@ export function formatHeaderLine(state) {
     const role = String(state.voiceSpeakerRole || "self").toUpperCase().slice(0, 4);
     return truncateAscii(`REC [${state.screen}] MIC:${role} ${hh}:${mm} ${batt}`, G2_TEXT_LIMITS.HEADER_CHARS);
   }
+  if (state.pendingTrade) {
+    const imuTag = state.imuActive ? "IMU:ON" : "CONFIRM";
+    return truncateAscii(`ORDER [${imuTag}] ${hh}:${mm} PAPER`, G2_TEXT_LIMITS.HEADER_CHARS);
+  }
   if (state.pendingReply) {
     const imuTag = state.imuActive ? "IMU:ON" : "CONFIRM";
     return truncateAscii(`CONFIRM [${imuTag}] ${hh}:${mm} ${tg}`, G2_TEXT_LIMITS.HEADER_CHARS);
+  }
+  if (state.screen === "WALLET") {
+    const netTag = state.hlNetwork === "testnet" ? "HL:TEST" : "HL:MAIN";
+    const wTag = state.walletSource === "LIVE" ? "LIVE" : "READ";
+    return truncateAscii(`GLANCE [WALLET] ${hh}:${mm} ${netTag} ${wTag}`, G2_TEXT_LIMITS.HEADER_CHARS);
   }
   return truncateAscii(`GLANCE [${state.screen}] ${hh}:${mm} ${live} ${tg}`, G2_TEXT_LIMITS.HEADER_CHARS);
 }
 
 export function getListItemsForState(state) {
+  if (state.pendingTrade) {
+    return [
+      truncateAscii("Confirm & Execute (Tap/Nod)", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
+      truncateAscii("Re-Speak Voice Order / Bet", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
+      truncateAscii("Cancel Ticket (Shake/2xTap)", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
+    ];
+  }
+
   switch (state.screen) {
     case "FOCUS": {
       if (state.pendingReply) {
@@ -180,13 +286,16 @@ export function getListItemsForState(state) {
       const total = Math.max(1, (state.messages || []).length);
       const nextNum = ((state.messageIndex || 0) + 1) % total + 1;
       return [
-        truncateAscii(state.voiceRecording ? "Stop Mic & Draft Reply" : "Voice Reply (Hold Ring/R)", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
+        truncateAscii(state.voiceRecording ? "Stop Mic & Draft" : "Voice Cmd/Reply (Hold R1)", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
         truncateAscii(`Reply: ${smart[0].label}`, G2_TEXT_LIMITS.LIST_ITEM_CHARS),
         truncateAscii(`Reply: ${smart[1].label}`, G2_TEXT_LIMITS.LIST_ITEM_CHARS),
         truncateAscii(`Next Msg (${nextNum}/${total})`, G2_TEXT_LIMITS.LIST_ITEM_CHARS),
         truncateAscii(`Reply: ${smart[2].label}`, G2_TEXT_LIMITS.LIST_ITEM_CHARS),
       ];
     }
+
+    case "WALLET":
+      return buildWalletListEntries(state).map((e) => e.label);
 
     case "PERPS":
       return (state.perps || []).slice(0, 6).map((p) => {
@@ -209,10 +318,10 @@ export function getListItemsForState(state) {
       const hasDraft = Boolean(state.pendingReply?.text);
       return [
         truncateAscii(
-          state.voiceRecording ? "Stop Mic & Preview Draft" : hasDraft ? "Confirm & Send to Telegram" : "Start G2 Mic Recording",
+          state.voiceRecording ? "Stop Mic & Preview" : hasDraft ? "Confirm & Send to Telegram" : "Start G2 Mic (Reply/Order)",
           G2_TEXT_LIMITS.LIST_ITEM_CHARS
         ),
-        truncateAscii("Re-Record Voice Reply", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
+        truncateAscii("Re-Record Voice Command", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
         truncateAscii("Append Live Market Context", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
         truncateAscii("Cancel & Return to Focus", G2_TEXT_LIMITS.LIST_ITEM_CHARS),
       ];
@@ -225,9 +334,9 @@ export function getListItemsForState(state) {
 
 export function deriveToastHeading(toastMsg) {
   const s = String(toastMsg || "");
-  if (/\b(err|error|fail|failed|blocked)\b/i.test(s)) return "ERROR";
+  if (/\b(err|error|fail|failed|blocked|invalid|insufficient)\b/i.test(s)) return "ERROR";
   if (/\b(cancel|canceled|cancelled|disarm|disarmed)\b/i.test(s)) return "CANCELED";
-  if (/\b(sync|synced|connected|ready)\b/i.test(s)) return "NOTICE";
+  if (/\b(sync|synced|connected|ready|reset)\b/i.test(s)) return "NOTICE";
   return "CONFIRMED";
 }
 
@@ -239,6 +348,22 @@ export function buildDetailTextForScreen(state) {
     return [truncateAscii(deriveToastHeading(state.toast), lim), ...wrapped].slice(0, G2_TEXT_LIMITS.CARD_MAX_LINES).join("\n");
   }
 
+  if (state.pendingTrade) {
+    const t = state.pendingTrade;
+    if (t.kind === "PAPER_PERP") {
+      return [
+        truncateAscii(`ORDER ${t.side} ${t.coin} $${t.sizeUsd} ${t.leverage}x`, lim),
+        truncateAscii(`Mark $${formatPrice(t.entryPx)} Mgn $${t.marginUsd.toFixed(0)}`, lim),
+        truncateAscii("Paper Perp (No Keys)", lim),
+      ].join("\n");
+    }
+    return [
+      truncateAscii(`BET ${t.outcome} $${t.stakeUsd} @${t.entryOddsPct}%`, lim),
+      truncateAscii(t.question, lim),
+      truncateAscii(`Max $${t.maxPayoutUsd.toFixed(0)} (Paper PM)`, lim),
+    ].join("\n");
+  }
+
   if (state.pendingReply && (state.screen === "FOCUS" || state.screen === "VOICE")) {
     const target = truncateAscii(`TO ${state.pendingReply.targetLabel || "Telegram"}`, lim);
     const preview = String(state.pendingReply.text || "").replace(/^\[G2(?: Voice)?\]\s*/i, "");
@@ -248,7 +373,7 @@ export function buildDetailTextForScreen(state) {
 
   if (state.voiceRecording) {
     const role = String(state.voiceSpeakerRole || "self").toUpperCase();
-    const partial = state.voiceTranscript || "Speak now (G2 16kHz mic)...";
+    const partial = state.voiceTranscript || "Say reply or Long BTC 100...";
     const lines = wrapLinesToBudget(partial, lim, 2);
     return [truncateAscii(`LISTENING (${role})`, lim), ...lines].slice(0, G2_TEXT_LIMITS.CARD_MAX_LINES).join("\n");
   }
@@ -263,6 +388,64 @@ export function buildDetailTextForScreen(state) {
       const header = truncateAscii(`${badge} ${msg.from} ${num}/${total}`, lim);
       const bodyLines = wrapLinesToBudget(msg.text, lim, 2);
       return [header, ...bodyLines].slice(0, G2_TEXT_LIMITS.CARD_MAX_LINES).join("\n");
+    }
+
+    case "WALLET": {
+      const entries = buildWalletListEntries(state);
+      const idx = Math.max(0, Math.min(state.selectedIndex || 0, entries.length - 1));
+      const row = entries[idx] || entries[0];
+      const netTag = state.hlNetwork === "testnet" ? "TEST" : "MAIN";
+
+      if (row?.kind === "PAPER_PERP") {
+        const p = row.item;
+        return [
+          truncateAscii(`PAPER ${p.side} ${p.coin} ${p.leverage}x`, lim),
+          truncateAscii(`Ent $${formatPrice(p.entryPx)} Now $${formatPrice(p.currentPx)}`, lim),
+          truncateAscii(`uPnL ${formatSignedUsd(p.uPnlUsd)} Tap:Close`, lim),
+        ].join("\n");
+      }
+
+      if (row?.kind === "PAPER_BET") {
+        const b = row.item;
+        return [
+          truncateAscii(`PAPER BET ${b.outcome} $${b.stakeUsd}`, lim),
+          truncateAscii(b.question, lim),
+          truncateAscii(`${b.entryOddsPct}%->${b.currentOddsPct}% ${formatSignedUsd(b.uPnlUsd)}`, lim),
+        ].join("\n");
+      }
+
+      if (row?.kind === "HL_POS") {
+        const pos = row.item;
+        return [
+          truncateAscii(`HL ${pos.coin} ${pos.side} ${pos.leverage}x`, lim),
+          truncateAscii(`Val ${formatCompactUsd(pos.positionValue)} Ent $${formatPrice(pos.entryPx)}`, lim),
+          truncateAscii(`uPnL ${formatSignedUsd(pos.unrealizedPnl, { compact: true })} ROE ${formatSignedPct(pos.roePct)}`, lim),
+        ].join("\n");
+      }
+
+      if (row?.kind === "VOICE_TRADE") {
+        return [
+          truncateAscii("VOICE PAPER EXECUTION", lim),
+          truncateAscii("Say: Long BTC 100 /", lim),
+          truncateAscii("Bet Yes 50 on Fed", lim),
+        ].join("\n");
+      }
+
+      const w = row?.wallet;
+      const paper = row?.paper;
+      if (w) {
+        const wNet = w.network === "testnet" ? "TEST" : "MAIN";
+        return [
+          truncateAscii(`HL ${wNet} ${w.shortAddress}`, lim),
+          truncateAscii(`Eq ${formatCompactUsd(w.accountValue)} Mgn ${w.marginRatioPct}%`, lim),
+          truncateAscii(`Pos:${w.totalPositionCount} Ppr:${formatCompactUsd(paper?.totalEquityUsd || 10000)}`, lim),
+        ].join("\n");
+      }
+      return [
+        truncateAscii(`HL ${netTag} WATCH WALLET`, lim),
+        truncateAscii(state.walletError || "Tap Row 0 to sync live", lim),
+        truncateAscii(`Paper Eq ${formatCompactUsd(paper?.totalEquityUsd || 10000)}`, lim),
+      ].join("\n");
     }
 
     case "PERPS": {
@@ -289,8 +472,8 @@ export function buildDetailTextForScreen(state) {
 
     case "VOICE": {
       const msg = getActiveMessage(state);
-      const toLine = truncateAscii(`REPLY -> ${msg?.from || "Telegram"}`, lim);
-      const tip = wrapLinesToBudget("Hold R1 ring or tap Start Mic to dictate.", lim, 2);
+      const toLine = truncateAscii(`VOICE -> ${msg?.from || "Desk"} / Trade`, lim);
+      const tip = wrapLinesToBudget("Hold R1: reply or say Long BTC 100 / Bet Yes 50.", lim, 2);
       return [toLine, ...tip].slice(0, G2_TEXT_LIMITS.CARD_MAX_LINES).join("\n");
     }
 
@@ -305,6 +488,9 @@ export function buildKpiLineForScreen(state) {
   if (state.voiceRecording) {
     return truncateAscii(`REC ${state.voiceSeconds || 0}s MIC`, lim);
   }
+  if (state.pendingTrade) {
+    return truncateAscii(state.imuActive ? "NOD:OK SHK:NO" : "TAP TO FILL", lim);
+  }
   if (state.pendingReply) {
     return truncateAscii(state.imuActive ? "NOD:OK SHK:NO" : "TAP TO SEND", lim);
   }
@@ -313,6 +499,22 @@ export function buildKpiLineForScreen(state) {
     case "FOCUS": {
       const ctx = getFocusContext(state);
       return truncateAscii(ctx.kpiShort, lim);
+    }
+    case "WALLET": {
+      const entries = buildWalletListEntries(state);
+      const idx = Math.max(0, Math.min(state.selectedIndex || 0, entries.length - 1));
+      const row = entries[idx] || entries[0];
+      if (row?.kind === "PAPER_PERP" || row?.kind === "PAPER_BET") {
+        return truncateAscii(`PPR ${formatSignedUsd(row.item.uPnlUsd, { compact: true })}`, lim);
+      }
+      if (row?.kind === "HL_POS") {
+        return truncateAscii(`PNL ${formatSignedUsd(row.item.unrealizedPnl, { compact: true })}`, lim);
+      }
+      if (row?.wallet) {
+        return truncateAscii(`PNL ${formatSignedUsd(row.wallet.totalUnrealizedPnl, { compact: true })}`, lim);
+      }
+      const paper = computePaperPortfolioMetrics(state?.paperBook, state);
+      return truncateAscii(`PPR ${formatCompactUsd(paper.totalEquityUsd)}`, lim);
     }
     case "PERPS": {
       const p = state.perps?.[state.selectedIndex || 0] || state.perps?.[0];
@@ -330,17 +532,23 @@ export function buildKpiLineForScreen(state) {
 }
 
 export function buildFooterLine(state) {
+  if (state.pendingTrade) {
+    return truncateAscii("Tap/Nod:Execute  2xTap/Shake:Cancel", G2_TEXT_LIMITS.FOOTER_CHARS);
+  }
   if (state.pendingReply) {
     return truncateAscii("Tap/Nod:Send  2xTap/Shake:Cancel", G2_TEXT_LIMITS.FOOTER_CHARS);
   }
   if (state.voiceRecording) {
-    return truncateAscii("Release Ring/Temple to draft reply", G2_TEXT_LIMITS.FOOTER_CHARS);
+    return truncateAscii("Release Ring/Temple to draft cmd", G2_TEXT_LIMITS.FOOTER_CHARS);
   }
   if (state.screen === "FOCUS") {
     return truncateAscii("Tap:Act  Hold:Voice  2xTap:Next  M:Menu", G2_TEXT_LIMITS.FOOTER_CHARS);
   }
+  if (state.screen === "WALLET") {
+    return truncateAscii("Tap:Act Hold:Trade 2xTap:TG M:Menu", G2_TEXT_LIMITS.FOOTER_CHARS);
+  }
   if (state.screen === "PERPS" || state.screen === "MARKETS") {
-    return truncateAscii("Tap:Alert  Hold:Voice  2xTap:TG  M:Menu", G2_TEXT_LIMITS.FOOTER_CHARS);
+    return truncateAscii("Tap:Alert  Hold:Trade  2xTap:TG  M:Menu", G2_TEXT_LIMITS.FOOTER_CHARS);
   }
   return truncateAscii("Tap:Send  Hold:Mic  2xTap:Focus  M:Menu", G2_TEXT_LIMITS.FOOTER_CHARS);
 }
@@ -350,6 +558,26 @@ export function buildFooterLine(state) {
  * corresponding to the current G2 screen/state.
  */
 export function buildGraphicForState(state) {
+  if (state.pendingTrade) {
+    const t = state.pendingTrade;
+    if (t.kind === "PAPER_BET") {
+      const liveM = (state.markets || []).find((m) => m.id === t.marketId);
+      return renderProbabilityBarImage(liveM?.yesPct ?? (t.outcome === "YES" ? t.entryOddsPct : 100 - t.entryOddsPct), {
+        width: SPARK_IMG_WIDTH,
+        height: SPARK_IMG_HEIGHT,
+        deltaText: liveM ? formatSignedPct(liveM.deltaPct) : `${t.outcome}`,
+      });
+    }
+    const p = (state.perps || []).find((x) => x.coin === t.coin);
+    const candles = state.candlesByCoin?.[t.coin] || state.candlesByCoin?.BTC || [];
+    return renderSparklineImage(candles, {
+      width: SPARK_IMG_WIDTH,
+      height: SPARK_IMG_HEIGHT,
+      tag: `${t.coin} ${t.side}`,
+      deltaText: p ? formatSignedPct(p.change24h) : `${t.leverage}X`,
+    });
+  }
+
   if (state.voiceRecording || state.screen === "VOICE") {
     return renderMicWaveformImage(state.audioLevels || [], {
       width: SPARK_IMG_WIDTH,
@@ -360,6 +588,36 @@ export function buildGraphicForState(state) {
         : state.pendingReply
           ? "CONFIRM"
           : "READY",
+    });
+  }
+
+  if (state.screen === "WALLET") {
+    const entries = buildWalletListEntries(state);
+    const idx = Math.max(0, Math.min(state.selectedIndex || 0, entries.length - 1));
+    const row = entries[idx] || entries[0];
+    if (row?.kind === "PAPER_BET") {
+      const liveM = (state.markets || []).find((m) => m.id === row.item.marketId);
+      const fallbackYesPct =
+        row.item.outcome === "YES" ? row.item.currentOddsPct : 100 - row.item.currentOddsPct;
+      return renderProbabilityBarImage(liveM?.yesPct ?? fallbackYesPct, {
+        width: SPARK_IMG_WIDTH,
+        height: SPARK_IMG_HEIGHT,
+        deltaText: formatSignedUsd(row.item.uPnlUsd, { compact: true }),
+      });
+    }
+    const coin =
+      row?.kind === "PAPER_PERP"
+        ? row.item.coin
+        : row?.kind === "HL_POS"
+          ? row.item.coin
+          : state.walletData?.positions?.[0]?.coin || "BTC";
+    const perp = (state.perps || []).find((p) => p.coin === coin);
+    const candles = state.candlesByCoin?.[coin] || state.candlesByCoin?.BTC || [];
+    return renderSparklineImage(candles, {
+      width: SPARK_IMG_WIDTH,
+      height: SPARK_IMG_HEIGHT,
+      tag: `${coin} 24H`,
+      deltaText: perp ? formatSignedPct(perp.change24h) : "",
     });
   }
 
@@ -548,7 +806,7 @@ export function buildDetailUpgrade(state) {
     contentOffset: 0,
     contentLength: content.length,
     content,
-    textColor: state.toast || state.pendingReply ? 4 : 3,
+    textColor: state.toast || state.pendingReply || state.pendingTrade ? 4 : 3,
   });
 }
 
@@ -560,7 +818,7 @@ export function buildKpiUpgrade(state) {
     contentOffset: 0,
     contentLength: content.length,
     content,
-    textColor: state.voiceRecording || state.pendingReply ? 4 : 3,
+    textColor: state.voiceRecording || state.pendingReply || state.pendingTrade ? 4 : 3,
   });
 }
 

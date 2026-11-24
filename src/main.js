@@ -1,6 +1,6 @@
 /**
- * GlancePulse v2.0 Main Controller — Voice-First Telegram & Live Market Copilot
- * for Even Realities G2 Smart Glasses + Companion Optical Simulator.
+ * GlancePulse v2.1 Main Controller — Voice-First Crypto, DeFi & Telegram Copilot
+ * for Even Realities G2 Smart Glasses + Minimal-White Companion Console.
  *
  * Dual-mode architecture:
  *   1. Native EvenHub WebView / Official `@evenrealities/evenhub-simulator`:
@@ -9,8 +9,9 @@
  *      `audioControl`, `imuControl`, `onLaunchSource`, `onDeviceStatusChanged`,
  *      `onEvenHubEvent`, `shutDownPageContainer`, Even localStorage).
  *   2. Browser Companion & Optical Simulator: authentic 576x288 4-bit green G2
- *      canvas (with 21px-proportioned typography & grayscale sparklines), full
- *      temple/R1-ring/voice/IMU emulation, and threaded Telegram Bot/Channel I/O.
+ *      waveguide canvas, zero-auth live Hyperliquid wallet/positions reader
+ *      (`clearinghouseState`), voice-to-1-tap/IMU paper perp & Polymarket bet
+ *      execution with live mark-to-market uPnL, and threaded Telegram Bot/Channel I/O.
  */
 
 import {
@@ -26,16 +27,23 @@ import {
   FALLBACK_CANDLES,
   FALLBACK_HYPERLIQUID,
   FALLBACK_POLYMARKET,
+  PRESET_WALLETS,
   VOICE_PRESET_TRANSCRIPTS,
   buildPulseSummaryText,
   buildSmartReplies,
   evaluateAlerts,
   fetchHyperliquidCandles,
   fetchHyperliquidPerps,
+  fetchHyperliquidWallet,
   fetchPolymarketMarkets,
   fetchTelegramInbox,
+  formatCompactUsd,
+  formatPrice,
+  formatSignedPct,
+  isValidEvmAddress,
   mergeInboxMessages,
   sendTelegramMessage,
+  truncateAscii,
 } from "./feeds.js";
 import {
   CONTAINER_IDS,
@@ -50,6 +58,7 @@ import {
   buildHeaderUpgrade,
   buildImageUpdate,
   buildKpiUpgrade,
+  buildWalletListEntries,
   getActiveMessage,
   getFocusContext,
   getListItemsForState,
@@ -60,6 +69,17 @@ import {
   computePcm16Rms,
   normalizeEvenHubListEvent,
 } from "./imu-gesture.js";
+import {
+  VOICE_TRADE_PRESETS,
+  closePaperPosition,
+  computePaperPortfolioMetrics,
+  createDefaultPaperBook,
+  executePaperIntent,
+  formatSignedUsd,
+  formatUsd,
+  normalizePaperBook,
+  parseVoiceTradeIntent,
+} from "./trading.js";
 import { renderG2Canvas } from "./simulator.js";
 
 const STORAGE_KEYS = {
@@ -69,6 +89,9 @@ const STORAGE_KEYS = {
   TG_OFFSET: "glancepulse_tg_offset",
   TG_MESSAGES: "glancepulse_tg_messages_v2",
   ALERTS: "glancepulse_alerts_v2",
+  HL_NETWORK: "glancepulse_hl_network_v21",
+  WALLET_ADDR: "glancepulse_wallet_addr_v21",
+  PAPER_BOOK: "glancepulse_paper_book_v21",
 };
 
 const imuDetector = new ImuGestureDetector();
@@ -86,6 +109,7 @@ const state = {
   startedUp: false,
   batteryLevel: 94,
   nowMs: Date.now(),
+  hlNetwork: "mainnet", // "mainnet" | "testnet"
   hlSource: "DEMO",
   pmSource: "DEMO",
   tgSource: "DEMO",
@@ -98,7 +122,14 @@ const state = {
   tgChatId: "",
   tgProxyUrl: "",
   tgOffset: 0,
-  // Voice & IMU confirmation loop
+  // Live read-only Hyperliquid wallet (`clearinghouseState`, zero keys)
+  walletAddress: PRESET_WALLETS.mainnet.address,
+  walletSource: "IDLE", // "IDLE" | "LIVE" | "ERROR" | "INVALID"
+  walletData: null,
+  walletError: "",
+  // Non-custodial paper perp & Polymarket bet ledger
+  paperBook: createDefaultPaperBook(),
+  // Voice & IMU confirmation loop (handles BOTH Telegram reply & Crypto/DeFi paper trade)
   voiceRecording: false,
   voiceSpeakerRole: AudioSpeakerRole.Self,
   voiceTranscript: "",
@@ -108,6 +139,7 @@ const state = {
   audioLevels: new Array(16).fill(0.1),
   lastAudioGraphicMs: 0,
   pendingReply: null, // { text, targetLabel, chatId, replyToMessageId, armAlert? }
+  pendingTrade: null, // parsed PAPER_PERP or PAPER_BET intent awaiting Nod / 1-Tap
   imuActive: false,
   voicePresetIdx: 0,
   // UI & transport telemetry
@@ -122,7 +154,9 @@ const state = {
 
 // Serialized BLE write queue prevents concurrent page/text/image/mic races
 let bleQueue = Promise.resolve();
-let refreshInFlight = false;
+let feedRefreshSeq = 0;
+let hlRefreshSeq = 0;
+let walletRefreshSeq = 0;
 let speechRecognition = null;
 let voiceDemoTimer = null;
 let voiceDemoFinishTimer = null;
@@ -144,7 +178,7 @@ function enqueueBridge(opLabel, fn) {
 function logWire(op, summary) {
   const ts = new Date().toTimeString().slice(0, 8);
   state.wireLog.unshift(`[${ts}] ${op} — ${summary}`);
-  if (state.wireLog.length > 22) state.wireLog.length = 22;
+  if (state.wireLog.length > 26) state.wireLog.length = 26;
 }
 
 function formatEventSource(src) {
@@ -162,6 +196,14 @@ function clampSelection() {
     state.messageIndex = Math.max(0, Math.min(state.messageIndex, state.messages.length - 1));
   } else {
     state.messageIndex = 0;
+  }
+}
+
+function clearToast() {
+  state.toast = "";
+  if (state.toastTimer) {
+    clearTimeout(state.toastTimer);
+    state.toastTimer = null;
   }
 }
 
@@ -191,6 +233,9 @@ async function saveConfig() {
       [STORAGE_KEYS.TG_OFFSET, String(state.tgOffset || 0)],
       [STORAGE_KEYS.TG_MESSAGES, JSON.stringify(liveMessages)],
       [STORAGE_KEYS.ALERTS, JSON.stringify(state.alerts)],
+      [STORAGE_KEYS.HL_NETWORK, state.hlNetwork],
+      [STORAGE_KEYS.WALLET_ADDR, state.walletAddress],
+      [STORAGE_KEYS.PAPER_BOOK, JSON.stringify(state.paperBook)],
     ];
     if (state.bridgeMode === "EVENHUB" && state.bridge) {
       for (const [k, v] of entries) {
@@ -229,6 +274,20 @@ async function loadConfig() {
     if (rawAlerts) {
       const parsed = JSON.parse(rawAlerts);
       if (Array.isArray(parsed)) state.alerts = parsed;
+    }
+    const savedNet = await readKey(STORAGE_KEYS.HL_NETWORK);
+    if (savedNet === "testnet" || savedNet === "mainnet") {
+      state.hlNetwork = savedNet;
+    }
+    const savedWallet = await readKey(STORAGE_KEYS.WALLET_ADDR);
+    if (isValidEvmAddress(savedWallet)) {
+      state.walletAddress = savedWallet;
+    } else {
+      state.walletAddress = PRESET_WALLETS[state.hlNetwork].address;
+    }
+    const rawPaper = await readKey(STORAGE_KEYS.PAPER_BOOK);
+    if (rawPaper) {
+      state.paperBook = normalizePaperBook(JSON.parse(rawPaper));
     }
   } catch {
     // Keep clean defaults if storage is empty or malformed.
@@ -322,7 +381,7 @@ async function setImuListening(enabled) {
   if (state.imuActive === enabled) return;
   state.imuActive = enabled;
   imuDetector.reset();
-  logWire("imuControl", enabled ? "ON (P200) — Nod=Send, Shake=Cancel" : "OFF (power save)");
+  logWire("imuControl", enabled ? "ON (P200) — Nod=Confirm, Shake=Cancel" : "OFF (power save)");
 
   if (state.bridgeMode === "EVENHUB" && state.bridge) {
     await enqueueBridge("imuControl", async () => {
@@ -337,14 +396,16 @@ async function setImuListening(enabled) {
 
 async function switchScreen(nextScreen) {
   if (!SCREENS.includes(nextScreen)) return;
-  if (nextScreen === "PERPS" || nextScreen === "MARKETS") {
-    if (state.voiceRecording) {
-      await abortVoiceCapture({ skipSync: true });
-    }
-    if (state.pendingReply) {
-      state.pendingReply = null;
-      await setImuListening(false);
-    }
+  if (state.voiceRecording) {
+    await abortVoiceCapture({ skipSync: true });
+  }
+  if (state.pendingTrade) {
+    state.pendingTrade = null;
+    await setImuListening(false);
+  }
+  if ((nextScreen === "PERPS" || nextScreen === "MARKETS" || nextScreen === "WALLET") && state.pendingReply) {
+    state.pendingReply = null;
+    await setImuListening(false);
   }
   state.screen = nextScreen;
   state.selectedIndex = 0;
@@ -363,12 +424,19 @@ function nextMessage() {
   state.selectedIndex = 0;
   const ctx = getFocusContext(state);
   if (ctx.kind === "perp" && ctx.perp && !state.candlesByCoin[ctx.perp.coin]) {
-    fetchHyperliquidCandles(ctx.perp.coin).then((c) => {
+    fetchHyperliquidCandles(ctx.perp.coin, globalThis.fetch, Date.now(), { network: state.hlNetwork }).then((c) => {
       state.candlesByCoin[c.coin] = c.closes;
       syncIncrementalUpdate({ includeImage: true }).catch(() => {});
     });
   }
   syncFullPage();
+}
+
+async function ensureCandlesForCoin(coin) {
+  const sym = String(coin || "").toUpperCase();
+  if (!sym || state.candlesByCoin[sym]) return;
+  const c = await fetchHyperliquidCandles(sym, globalThis.fetch, Date.now(), { network: state.hlNetwork });
+  state.candlesByCoin[c.coin] = c.closes;
 }
 
 async function armAlertSpec(spec) {
@@ -383,27 +451,32 @@ async function armAlertSpec(spec) {
   return true;
 }
 
+async function togglePerpAlertByCoin(coin) {
+  const p = state.perps.find((x) => x.coin === coin);
+  const existingIdx = state.alerts.findIndex((a) => a.kind === "perp" && a.target === coin);
+  if (existingIdx >= 0) {
+    state.alerts.splice(existingIdx, 1);
+    showToast(`Disarmed ${coin} perp alert`, 3000, { skipSync: true });
+  } else {
+    state.alerts.push({
+      kind: "perp",
+      target: coin,
+      anchorPrice: p?.markPx || 0,
+      thresholdPct: 2.0,
+      fundingLimit: 35,
+      triggered: false,
+    });
+    showToast(`Armed ${coin} ±2% & funding alert`, 3000, { skipSync: true });
+  }
+  await saveConfig();
+  await syncFullPage();
+}
+
 async function toggleAlertForSelection() {
   if (state.screen === "PERPS") {
     const p = state.perps[state.selectedIndex] || state.perps[0];
     if (!p) return;
-    const existingIdx = state.alerts.findIndex((a) => a.kind === "perp" && a.target === p.coin);
-    if (existingIdx >= 0) {
-      state.alerts.splice(existingIdx, 1);
-      showToast(`Disarmed ${p.coin} perp alert`, 3200, { skipSync: true });
-    } else {
-      state.alerts.push({
-        kind: "perp",
-        target: p.coin,
-        anchorPrice: p.markPx,
-        thresholdPct: 2.0,
-        fundingLimit: 35,
-        triggered: false,
-      });
-      showToast(`Armed ${p.coin} ±2% & funding alert`, 3200, { skipSync: true });
-    }
-    await saveConfig();
-    await syncFullPage();
+    await togglePerpAlertByCoin(p.coin);
     return;
   }
 
@@ -429,7 +502,7 @@ async function toggleAlertForSelection() {
     return;
   }
 
-  // On FOCUS/VOICE: arm alert for the currently entity-linked market
+  // On FOCUS/VOICE/WALLET: arm alert for the currently entity-linked market
   const ctx = getFocusContext(state);
   if (ctx.kind === "polymarket" && ctx.market) {
     await armAlertSpec({ kind: "polymarket", target: ctx.market.id, anchorPct: ctx.market.yesPct, thresholdPct: 5 });
@@ -482,6 +555,8 @@ async function dispatchTelegram(text, { chatId = "", replyToMessageId = null, ta
 
 async function queueReplyForConfirmation(text, { armAlert = null } = {}) {
   const msg = getActiveMessage(state);
+  clearToast();
+  state.pendingTrade = null;
   state.pendingReply = {
     text: String(text || "").trim(),
     targetLabel: msg?.from || "Telegram",
@@ -519,6 +594,172 @@ async function cancelPendingReply(via = "CANCEL", { skipSync = false } = {}) {
   if (!skipSync) {
     await syncFullPage();
   }
+}
+
+async function queueTradeForConfirmation(intent) {
+  clearToast();
+  state.pendingReply = null;
+  state.pendingTrade = intent;
+  state.selectedIndex = 0;
+  if (intent.kind === "PAPER_PERP") {
+    ensureCandlesForCoin(intent.coin)
+      .then(() => syncIncrementalUpdate({ includeImage: true }).catch(() => {}))
+      .catch(() => {});
+  }
+  logWire("trade.preview", `${intent.kind} ${intent.summaryShort}`);
+  await setImuListening(true);
+  await syncFullPage();
+}
+
+async function confirmPendingTrade(via = "TAP") {
+  if (!state.pendingTrade) return;
+  const intent = state.pendingTrade;
+  state.pendingTrade = null;
+  await setImuListening(false);
+
+  const res = executePaperIntent(state.paperBook, intent, Date.now());
+  if (!res.ok) {
+    logWire("paper.err", res.error || "Execution failed");
+    showToast(`Order err: ${res.error}`, 3800, { skipSync: true });
+    await syncFullPage();
+    return false;
+  }
+
+  state.paperBook = res.book;
+  await saveConfig();
+  logWire("paper.execute", `via=${via} ${intent.summaryShort} (non-custodial)`);
+
+  const msg =
+    intent.kind === "PAPER_PERP"
+      ? `Filled ${intent.side} ${intent.coin} $${intent.sizeUsd} ${intent.leverage}x`
+      : `Bet ${intent.outcome} $${intent.stakeUsd} @${intent.entryOddsPct}%`;
+  state.screen = "WALLET";
+  const walletEntries = buildWalletListEntries(state);
+  const matchIdx = walletEntries.findIndex((e) => e.item?.id === res.record.id);
+  state.selectedIndex = matchIdx >= 0 ? matchIdx : 1;
+  showToast(msg, 3400, { skipSync: true });
+  await syncFullPage();
+  return true;
+}
+
+async function cancelPendingTrade(via = "CANCEL", { skipSync = false } = {}) {
+  if (!state.pendingTrade) return;
+  state.pendingTrade = null;
+  await setImuListening(false);
+  logWire("cancel.trade", `via=${via}`);
+  showToast(`Order canceled (${via})`, 2400, { skipSync: true });
+  if (!skipSync) {
+    await syncFullPage();
+  }
+}
+
+async function closePaperById(id) {
+  const res = closePaperPosition(state.paperBook, id, { perps: state.perps, markets: state.markets }, Date.now());
+  if (!res.ok) return false;
+  state.paperBook = res.book;
+  await saveConfig();
+  const label =
+    res.closed.kind === "PAPER_PERP"
+      ? `${res.closed.side} ${res.closed.coin}`
+      : `${res.closed.outcome} bet`;
+  logWire("paper.close", `${label} realized=${formatSignedUsd(res.realizedPnlUsd)}`);
+  showToast(`Closed ${label} (${formatSignedUsd(res.realizedPnlUsd)})`, 3200, { skipSync: true });
+  await syncFullPage();
+  return true;
+}
+
+async function resetPaperBook() {
+  state.paperBook = createDefaultPaperBook();
+  await saveConfig();
+  logWire("paper.reset", "Reset paper bankroll to $10,000 USDC");
+  showToast("Reset paper ledger to $10,000", 2600, { skipSync: true });
+  await syncFullPage();
+}
+
+async function refreshWalletData(notify = false) {
+  const seq = ++walletRefreshSeq;
+  const net = state.hlNetwork;
+  const addr = String(state.walletAddress || "").trim();
+  if (!addr) {
+    state.walletSource = "IDLE";
+    state.walletData = null;
+    state.walletError = "";
+    renderCompanion();
+    return;
+  }
+
+  state.walletSource = "LOADING";
+  state.walletData = null;
+  state.walletError = "";
+  renderCompanion();
+
+  const res = await fetchHyperliquidWallet({ address: addr, network: net });
+  if (seq !== walletRefreshSeq || state.hlNetwork !== net) return;
+
+  state.walletSource = res.source;
+  state.walletData = res.wallet;
+  state.walletError = res.error || "";
+
+  if (res.source === "LIVE" && res.wallet) {
+    logWire(
+      "hl.wallet",
+      `${res.network.toUpperCase()} ${res.wallet.shortAddress} eq=${formatCompactUsd(res.wallet.accountValue)} pos=${res.wallet.totalPositionCount}`
+    );
+    const firstCoin = res.wallet.positions?.[0]?.coin;
+    if (firstCoin) {
+      ensureCandlesForCoin(firstCoin).catch(() => {});
+    }
+    if (notify) {
+      showToast(
+        `Synced HL ${res.network}: ${res.wallet.totalPositionCount} open pos`,
+        2600,
+        { skipSync: true }
+      );
+    }
+  } else {
+    logWire("hl.wallet.err", res.error || "Wallet lookup failed");
+    if (notify) {
+      showToast(`Wallet err: ${truncateAscii(res.error || "Failed", 32)}`, 3600, { skipSync: true });
+    }
+  }
+  await syncFullPage();
+}
+
+async function refreshHyperliquidNetwork(notify = true) {
+  const hSeq = ++hlRefreshSeq;
+  const wSeq = ++walletRefreshSeq;
+  const net = state.hlNetwork;
+  const addr = String(state.walletAddress || "").trim();
+
+  state.walletSource = isValidEvmAddress(addr) ? "LOADING" : "IDLE";
+  state.walletData = null;
+  state.walletError = "";
+  renderCompanion();
+
+  const [hl, btcCandles, walletRes] = await Promise.all([
+    fetchHyperliquidPerps(globalThis.fetch, { network: net }),
+    fetchHyperliquidCandles("BTC", globalThis.fetch, Date.now(), { network: net }),
+    isValidEvmAddress(addr)
+      ? fetchHyperliquidWallet({ address: addr, network: net })
+      : Promise.resolve(null),
+  ]);
+
+  if (hSeq !== hlRefreshSeq || state.hlNetwork !== net) return;
+  state.hlSource = hl.source;
+  state.perps = hl.perps;
+  state.candlesByCoin[btcCandles.coin] = btcCandles.closes;
+
+  if (walletRes && wSeq === walletRefreshSeq) {
+    state.walletSource = walletRes.source;
+    state.walletData = walletRes.wallet;
+    state.walletError = walletRes.error || "";
+  }
+
+  logWire("hl.network", `${net.toUpperCase()} perps=${hl.source} wallet=${state.walletSource}`);
+  if (notify) {
+    showToast(`HL ${net.toUpperCase()} synced (${state.walletSource})`, 2400, { skipSync: true });
+  }
+  await syncFullPage();
 }
 
 function stopBrowserSpeech() {
@@ -586,7 +827,9 @@ async function startVoiceCapture(
   { useBrowserSpeech = true, syntheticJitter = true } = {}
 ) {
   if (state.voiceRecording) return;
+  clearToast();
   state.pendingReply = null;
+  state.pendingTrade = null;
   await setImuListening(false);
   clearVoiceTimers();
   state.voiceRecording = true;
@@ -627,7 +870,7 @@ async function startVoiceCapture(
 
 /**
  * Cleanly abort an in-progress voice capture (e.g. on FOREGROUND_EXIT / SYSTEM_EXIT
- * or screen change) WITHOUT drafting a reply, arming IMU, or rebuilding the G2 page.
+ * or screen change) WITHOUT drafting a reply/trade, arming IMU, or rebuilding the G2 page.
  */
 async function abortVoiceCapture({ skipSync = true } = {}) {
   if (!state.voiceRecording) return;
@@ -649,6 +892,28 @@ async function abortVoiceCapture({ skipSync = true } = {}) {
   }
 }
 
+async function routeSpokenTranscript(transcript) {
+  const activeMarket =
+    state.screen === "MARKETS"
+      ? state.markets[state.selectedIndex] || state.markets[0]
+      : getFocusContext(state).market || state.markets[0];
+
+  const intent = parseVoiceTradeIntent(transcript, {
+    perps: state.perps,
+    markets: state.markets,
+    activeMarket,
+  });
+
+  if (intent) {
+    await queueTradeForConfirmation(intent);
+    return intent;
+  }
+
+  // Enrich conversational Telegram reply with "[G2 Voice]" provenance tag
+  await queueReplyForConfirmation(`[G2 Voice] ${transcript}`);
+  return null;
+}
+
 async function stopVoiceCapture({ forcedTranscript = "" } = {}) {
   if (!state.voiceRecording) return;
   state.voiceRecording = false;
@@ -664,34 +929,40 @@ async function stopVoiceCapture({ forcedTranscript = "" } = {}) {
 
   let transcript = String(forcedTranscript || state.voiceTranscript || "").trim();
   if (!transcript) {
-    // Graceful context-aware fallback so judges without mic hardware complete the full loop
-    const ctx = getFocusContext(state);
-    if (ctx.kind === "perp" && ctx.perp) {
-      transcript = `Copy — ${ctx.perp.coin} is $${ctx.perp.markPx}. Trim half and keep G2 alert armed.`;
-    } else if (ctx.kind === "polymarket" && ctx.market) {
-      transcript = `Tracking ${ctx.market.yesPct}% YES on Polymarket — ready to sync in 5m.`;
+    if (state.screen === "WALLET" || state.screen === "PERPS") {
+      const p = state.perps[state.selectedIndex] || state.perps[0];
+      transcript = `Long ${p?.coin || "BTC"} 100`;
+    } else if (state.screen === "MARKETS") {
+      transcript = "Bet Yes 50";
     } else {
-      transcript = VOICE_PRESET_TRANSCRIPTS[state.voicePresetIdx % VOICE_PRESET_TRANSCRIPTS.length];
-      state.voicePresetIdx++;
+      const ctx = getFocusContext(state);
+      if (ctx.kind === "perp" && ctx.perp) {
+        transcript = `Copy — ${ctx.perp.coin} is $${ctx.perp.markPx}. Trim half and keep G2 alert armed.`;
+      } else if (ctx.kind === "polymarket" && ctx.market) {
+        transcript = `Tracking ${ctx.market.yesPct}% YES on Polymarket — ready to sync in 5m.`;
+      } else {
+        transcript = VOICE_PRESET_TRANSCRIPTS[state.voicePresetIdx % VOICE_PRESET_TRANSCRIPTS.length];
+        state.voicePresetIdx++;
+      }
     }
   }
 
-  // Enrich voice reply automatically with "[G2 Voice]" provenance tag
-  await queueReplyForConfirmation(`[G2 Voice] ${transcript}`);
+  await routeSpokenTranscript(transcript);
 }
 
 /**
  * 1-click guided voice dictation demo for judges without a microphone or G2 glasses.
- * Injects realistic synthetic 16kHz PCM16 frames through `handleAudioFrame` without
- * triggering browser mic permission prompts or competing jitter timers.
+ * Works for BOTH Telegram replies AND Crypto/DeFi voice orders/bets (`Long BTC 100`,
+ * `Short ETH 250`, `Bet Yes 50 on Fed`) through the exact same PCM16 waveform pipeline.
  */
-async function runSimulatedVoiceDemo() {
+async function runSimulatedVoiceDemo(forcedCommand = "") {
   if (state.voiceRecording) {
-    await stopVoiceCapture();
-    return;
+    await abortVoiceCapture({ skipSync: true });
   }
-  const preset = VOICE_PRESET_TRANSCRIPTS[state.voicePresetIdx % VOICE_PRESET_TRANSCRIPTS.length];
-  state.voicePresetIdx++;
+  const preset =
+    String(forcedCommand || "").trim() ||
+    VOICE_PRESET_TRANSCRIPTS[state.voicePresetIdx++ % VOICE_PRESET_TRANSCRIPTS.length];
+
   await startVoiceCapture("R1 RING (SIM)", { useBrowserSpeech: false, syntheticJitter: false });
   const words = preset.split(" ");
   let idx = 0;
@@ -711,7 +982,7 @@ async function runSimulatedVoiceDemo() {
     }
     handleAudioFrame({ audioPcm: pcm, speakerRole: AudioSpeakerRole.Self });
 
-    idx += 2;
+    idx += Math.max(1, Math.ceil(words.length / 3));
     state.voiceTranscript = words.slice(0, idx).join(" ");
     syncIncrementalUpdate({ includeImage: true }).catch(() => {});
     if (idx >= words.length) {
@@ -722,9 +993,19 @@ async function runSimulatedVoiceDemo() {
         if (state.voiceRecording) {
           stopVoiceCapture({ forcedTranscript: preset }).catch(() => {});
         }
-      }, 360);
+      }, 280);
     }
-  }, 240);
+  }, 190);
+}
+
+export async function submitVoiceCommandText(commandText) {
+  const clean = String(commandText || "").trim();
+  if (!clean) return null;
+  if (state.voiceRecording) {
+    await abortVoiceCapture({ skipSync: true });
+  }
+  logWire("voice.cmd", truncateAscii(clean, 48));
+  return routeSpokenTranscript(clean);
 }
 
 async function handlePrimaryTap() {
@@ -738,6 +1019,13 @@ async function handlePrimaryTap() {
 
   if (state.voiceRecording) {
     await stopVoiceCapture();
+    return;
+  }
+
+  if (state.pendingTrade) {
+    if (state.selectedIndex === 0) await confirmPendingTrade(`${state.lastInputSource} TAP`);
+    else if (state.selectedIndex === 1) await startVoiceCapture(state.lastInputSource);
+    else await cancelPendingTrade("TAP");
     return;
   }
 
@@ -761,6 +1049,22 @@ async function handlePrimaryTap() {
       nextMessage();
     } else {
       await queueReplyForConfirmation(smart[2].text);
+    }
+    return;
+  }
+
+  if (state.screen === "WALLET") {
+    const entries = buildWalletListEntries(state);
+    const row = entries[state.selectedIndex] || entries[0];
+    if (!row) return;
+    if (row.kind === "SUMMARY") {
+      await refreshWalletData(true);
+    } else if (row.kind === "PAPER_PERP" || row.kind === "PAPER_BET") {
+      await closePaperById(row.item.id);
+    } else if (row.kind === "HL_POS") {
+      await togglePerpAlertByCoin(row.item.coin);
+    } else if (row.kind === "VOICE_TRADE") {
+      await startVoiceCapture(state.lastInputSource);
     }
     return;
   }
@@ -797,6 +1101,10 @@ async function handleDoubleTap() {
     renderCompanion();
     return;
   }
+  if (state.pendingTrade) {
+    await cancelPendingTrade("2xTAP");
+    return;
+  }
   if (state.pendingReply) {
     await cancelPendingReply("2xTAP");
     return;
@@ -822,6 +1130,16 @@ async function handleScroll(delta) {
   const items = getListItemsForState(state);
   if (items.length <= 0) return;
   state.selectedIndex = (state.selectedIndex + delta + items.length) % items.length;
+  if (state.screen === "WALLET") {
+    const entries = buildWalletListEntries(state);
+    const row = entries[state.selectedIndex];
+    const coin = row?.kind === "HL_POS" || row?.kind === "PAPER_PERP" ? row.item.coin : null;
+    if (coin && !state.candlesByCoin[coin]) {
+      ensureCandlesForCoin(coin)
+        .then(() => syncIncrementalUpdate({ includeImage: true }).catch(() => {}))
+        .catch(() => {});
+    }
+  }
   await syncIncrementalUpdate({ includeImage: true });
 }
 
@@ -829,6 +1147,9 @@ async function handleMenuAction(itemID) {
   switch (itemID) {
     case MENU_ACTION_IDS.SCREEN_FOCUS:
       switchScreen("FOCUS");
+      break;
+    case MENU_ACTION_IDS.SCREEN_WALLET:
+      switchScreen("WALLET");
       break;
     case MENU_ACTION_IDS.SCREEN_PERPS:
       switchScreen("PERPS");
@@ -862,106 +1183,123 @@ async function handleMenuAction(itemID) {
 }
 
 async function refreshAllFeeds(notify = false) {
-  if (refreshInFlight) return;
-  refreshInFlight = true;
-  try {
-    const activeCtx = getFocusContext(state);
-    const activeCoin =
-      state.screen === "PERPS"
-        ? state.perps[state.selectedIndex]?.coin || "BTC"
-        : activeCtx.perp?.coin || "BTC";
+  const seq = ++feedRefreshSeq;
+  const hSeq = ++hlRefreshSeq;
+  const wSeq = ++walletRefreshSeq;
+  const net = state.hlNetwork;
+  const addr = String(state.walletAddress || "").trim();
 
-    const [hl, pm, tg, activeCandles, btcCandles] = await Promise.all([
-      fetchHyperliquidPerps(),
-      fetchPolymarketMarkets(),
-      fetchTelegramInbox({
-        botToken: state.tgToken,
-        chatId: state.tgChatId,
-        offset: state.tgOffset,
-        proxyUrl: state.tgProxyUrl,
-      }),
-      fetchHyperliquidCandles(activeCoin),
-      activeCoin === "BTC" ? Promise.resolve(null) : fetchHyperliquidCandles("BTC"),
-    ]);
+  const activeCtx = getFocusContext(state);
+  const activeCoin =
+    state.screen === "PERPS"
+      ? state.perps[state.selectedIndex]?.coin || "BTC"
+      : activeCtx.perp?.coin || "BTC";
 
+  const [hl, pm, tg, activeCandles, btcCandles, walletRes] = await Promise.all([
+    fetchHyperliquidPerps(globalThis.fetch, { network: net }),
+    fetchPolymarketMarkets(),
+    fetchTelegramInbox({
+      botToken: state.tgToken,
+      chatId: state.tgChatId,
+      offset: state.tgOffset,
+      proxyUrl: state.tgProxyUrl,
+    }),
+    fetchHyperliquidCandles(activeCoin, globalThis.fetch, Date.now(), { network: net }),
+    activeCoin === "BTC"
+      ? Promise.resolve(null)
+      : fetchHyperliquidCandles("BTC", globalThis.fetch, Date.now(), { network: net }),
+    isValidEvmAddress(addr)
+      ? fetchHyperliquidWallet({ address: addr, network: net })
+      : Promise.resolve(null),
+  ]);
+
+  // Guard against stale responses if user triggered a newer refresh or network toggle
+  if (hSeq === hlRefreshSeq && state.hlNetwork === net) {
     state.hlSource = hl.source;
     state.perps = hl.perps;
-    state.pmSource = pm.source;
-    state.markets = pm.markets;
     state.candlesByCoin[activeCandles.coin] = activeCandles.closes;
     if (btcCandles) state.candlesByCoin[btcCandles.coin] = btcCandles.closes;
-
-    let tgSyncError = "";
-    if (tg.source === "LIVE") {
-      state.tgSource = "LIVE";
-      let persistNeeded = false;
-      if (tg.nextOffset > state.tgOffset) {
-        state.tgOffset = tg.nextOffset;
-        persistNeeded = true;
-      }
-      if (!state.tgChatId && tg.discoveredChatId) {
-        state.tgChatId = tg.discoveredChatId;
-        const chatInp = typeof document !== "undefined" ? document.getElementById("inp-tg-chat") : null;
-        if (chatInp) chatInp.value = state.tgChatId;
-        persistNeeded = true;
-      }
-      const cachedLive = (state.messages || []).filter((m) => !isDemoMessage(m));
-      if (tg.messages.length > 0) {
-        state.messages = mergeInboxMessages(cachedLive, tg.messages, 12);
-        persistNeeded = true;
-      } else if (cachedLive.length > 0) {
-        state.messages = cachedLive;
-      } else {
-        state.messages = [
-          {
-            id: 0,
-            kind: "CHAT",
-            from: "Bot Ready",
-            chatId: state.tgChatId,
-            time: "--:--",
-            text: "Connected. Message your bot or channel to view on G2.",
-          },
-        ];
-      }
-      if (persistNeeded) await saveConfig();
-    } else if (!state.tgToken) {
-      state.tgSource = "DEMO";
-    } else {
-      state.tgSource = "DEMO";
-      tgSyncError = String(tg.error || "Telegram getUpdates failed");
-      logWire("telegram.err", tgSyncError.slice(0, 72));
-    }
-
-    // Evaluate armed alerts and persist triggered flag so reload never double-fires!
-    const fired = evaluateAlerts(state);
-    if (fired.length > 0) {
-      for (const hit of fired) {
-        const ref = state.alerts.find((a) => a.kind === hit.kind && a.target === hit.target);
-        if (ref) ref.triggered = true;
-        await dispatchTelegram(`[GlancePulse ALERT] ${hit.reason}`, { targetLabel: "Price Alert" });
-      }
-      await saveConfig();
-    }
-
-    logWire(
-      "feeds.sync",
-      `HL=${hl.source}(${hl.perps.length}) PM=${pm.source}(${pm.markets.length}) TG=${state.tgSource} off=${state.tgOffset}`
-    );
-
-    if (notify) {
-      showToast(
-        tgSyncError
-          ? `TG Err: ${tgSyncError.slice(0, 34)}`
-          : `Synced HL:${hl.source} PM:${pm.source} TG:${state.tgSource}`,
-        tgSyncError ? 4000 : 2600,
-        { skipSync: true }
-      );
-    }
-    // Flicker-free incremental upgrade preserves G2 list selection!
-    await syncIncrementalUpdate({ includeImage: true });
-  } finally {
-    refreshInFlight = false;
   }
+
+  if (walletRes && wSeq === walletRefreshSeq && state.hlNetwork === net) {
+    state.walletSource = walletRes.source;
+    state.walletData = walletRes.wallet;
+    state.walletError = walletRes.error || "";
+  }
+
+  if (seq !== feedRefreshSeq) return;
+
+  state.pmSource = pm.source;
+  state.markets = pm.markets;
+
+  let tgSyncError = "";
+  if (tg.source === "LIVE") {
+    state.tgSource = "LIVE";
+    let persistNeeded = false;
+    if (tg.nextOffset > state.tgOffset) {
+      state.tgOffset = tg.nextOffset;
+      persistNeeded = true;
+    }
+    if (!state.tgChatId && tg.discoveredChatId) {
+      state.tgChatId = tg.discoveredChatId;
+      const chatInp = typeof document !== "undefined" ? document.getElementById("inp-tg-chat") : null;
+      if (chatInp) chatInp.value = state.tgChatId;
+      persistNeeded = true;
+    }
+    const cachedLive = (state.messages || []).filter((m) => !isDemoMessage(m));
+    if (tg.messages.length > 0) {
+      state.messages = mergeInboxMessages(cachedLive, tg.messages, 12);
+      persistNeeded = true;
+    } else if (cachedLive.length > 0) {
+      state.messages = cachedLive;
+    } else {
+      state.messages = [
+        {
+          id: 0,
+          kind: "CHAT",
+          from: "Bot Ready",
+          chatId: state.tgChatId,
+          time: "--:--",
+          text: "Connected. Message your bot or channel to view on G2.",
+        },
+      ];
+    }
+    if (persistNeeded) await saveConfig();
+  } else if (!state.tgToken) {
+    state.tgSource = "DEMO";
+  } else {
+    state.tgSource = "DEMO";
+    tgSyncError = String(tg.error || "Telegram getUpdates failed");
+    logWire("telegram.err", tgSyncError.slice(0, 72));
+  }
+
+  // Evaluate armed alerts and persist triggered flag so reload never double-fires!
+  const fired = evaluateAlerts(state);
+  if (fired.length > 0) {
+    for (const hit of fired) {
+      const ref = state.alerts.find((a) => a.kind === hit.kind && a.target === hit.target);
+      if (ref) ref.triggered = true;
+      await dispatchTelegram(`[GlancePulse ALERT] ${hit.reason}`, { targetLabel: "Price Alert" });
+    }
+    await saveConfig();
+  }
+
+  logWire(
+    "feeds.sync",
+    `HL(${state.hlNetwork})=${state.hlSource} W=${state.walletSource} PM=${pm.source} TG=${state.tgSource}`
+  );
+
+  if (notify) {
+    showToast(
+      tgSyncError
+        ? `TG Err: ${tgSyncError.slice(0, 34)}`
+        : `Synced HL:${state.hlSource} W:${state.walletSource} PM:${pm.source}`,
+      tgSyncError ? 4000 : 2600,
+      { skipSync: true }
+    );
+  }
+  // Flicker-free incremental upgrade preserves G2 list selection!
+  await syncIncrementalUpdate({ includeImage: true });
 }
 
 function handleAudioFrame(audio) {
@@ -984,7 +1322,10 @@ function handleImuData(imuData, nowMs = Date.now()) {
   const gesture = imuDetector.push(imuData, nowMs);
   if (!gesture) return;
   logWire("imu.gesture", `${gesture} detected`);
-  if (state.pendingReply) {
+  if (state.pendingTrade) {
+    if (gesture === "NOD") confirmPendingTrade("IMU NOD");
+    else if (gesture === "SHAKE") cancelPendingTrade("IMU SHAKE");
+  } else if (state.pendingReply) {
     if (gesture === "NOD") confirmPendingReply("IMU NOD");
     else if (gesture === "SHAKE") cancelPendingReply("IMU SHAKE");
   } else if (gesture === "SHAKE" && state.menuOpen) {
@@ -1067,7 +1408,146 @@ function simulateImuGesture(gesture) {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function renderWalletSection() {
+  const metricsEl = document.getElementById("wallet-metrics");
+  const tbodyEl = document.getElementById("wallet-positions-body");
+  const statusEl = document.getElementById("wallet-status-note");
+
+  document.querySelectorAll("[data-hl-net]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.hlNet === state.hlNetwork);
+  });
+
+  const w = state.walletData;
+  if (statusEl) {
+    if (state.walletSource === "LIVE" && w) {
+      statusEl.innerHTML = `<span class="pill pill-live">LIVE ${escapeHtml(w.network.toUpperCase())}</span> <span class="mono muted-inline">${escapeHtml(w.shortAddress)} &middot; zero-auth clearinghouseState</span>`;
+    } else if (state.walletSource === "LOADING") {
+      statusEl.innerHTML = `<span class="pill pill-accent">SYNCING ${escapeHtml(state.hlNetwork.toUpperCase())}</span> <span class="muted-inline">Querying public clearinghouseState...</span>`;
+    } else if (state.walletSource === "ERROR" || state.walletSource === "INVALID") {
+      statusEl.innerHTML = `<span class="pill pill-err">${escapeHtml(state.walletSource)}</span> <span class="muted-inline">${escapeHtml(state.walletError || "Unable to fetch wallet")}</span>`;
+    } else {
+      statusEl.innerHTML = `<span class="pill pill-neutral">READY</span> <span class="muted-inline">Zero private keys &middot; public read-only query</span>`;
+    }
+  }
+
+  if (metricsEl) {
+    const pnlClass = !w ? "" : w.totalUnrealizedPnl >= 0 ? "num-pos" : "num-neg";
+    metricsEl.innerHTML = `
+      <div class="metric-cell">
+        <span class="metric-label">Account Equity</span>
+        <span class="metric-value mono">${w ? formatCompactUsd(w.accountValue) : "—"}</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Margin Used</span>
+        <span class="metric-value mono">${w ? `${formatCompactUsd(w.totalMarginUsed)} (${w.marginRatioPct}%)` : "—"}</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Total uPnL</span>
+        <span class="metric-value mono ${pnlClass}">${w ? formatSignedUsd(w.totalUnrealizedPnl, { compact: true }) : "—"}</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Open Positions</span>
+        <span class="metric-value mono">${w ? String(w.totalPositionCount) : "0"}</span>
+      </div>
+    `;
+  }
+
+  if (tbodyEl) {
+    const positions = w?.allTopPositions?.slice(0, 6) || [];
+    if (positions.length === 0) {
+      tbodyEl.innerHTML = `<tr><td colspan="5" class="empty-cell">${
+        state.walletSource === "LIVE"
+          ? "No open perp positions on this address. Try 1-Click Live Preset."
+          : "Click Fetch or Load Live Preset to query real Hyperliquid positions."
+      }</td></tr>`;
+    } else {
+      tbodyEl.innerHTML = positions
+        .map((pos, idx) => {
+          const pnlCls = pos.unrealizedPnl >= 0 ? "num-pos" : "num-neg";
+          const sideCls = pos.side === "LONG" ? "tag-long" : "tag-short";
+          return `
+            <tr class="clickable-row" data-hl-pos-idx="${idx}">
+              <td class="mono strong">${escapeHtml(pos.coin)}</td>
+              <td><span class="side-tag ${sideCls}">${pos.side} ${pos.leverage}x</span></td>
+              <td class="mono num">${formatCompactUsd(pos.positionValue)}</td>
+              <td class="mono num">$${formatPrice(pos.entryPx)}</td>
+              <td class="mono num ${pnlCls}">${formatSignedUsd(pos.unrealizedPnl)}</td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+  }
+}
+
+function renderPaperSection() {
+  const metricsEl = document.getElementById("paper-metrics");
+  const tbodyEl = document.getElementById("paper-positions-body");
+  const metrics = computePaperPortfolioMetrics(state.paperBook, {
+    perps: state.perps,
+    markets: state.markets,
+  });
+
+  if (metricsEl) {
+    const upnlCls = metrics.unrealizedPnlUsd >= 0 ? "num-pos" : "num-neg";
+    const rpnlCls = metrics.realizedPnlUsd >= 0 ? "num-pos" : "num-neg";
+    metricsEl.innerHTML = `
+      <div class="metric-cell">
+        <span class="metric-label">Paper Equity</span>
+        <span class="metric-value mono">${formatUsd(metrics.totalEquityUsd)}</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Free Cash</span>
+        <span class="metric-value mono">${formatUsd(metrics.cashUsd)}</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Live uPnL</span>
+        <span class="metric-value mono ${upnlCls}">${formatSignedUsd(metrics.unrealizedPnlUsd)}</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Realized PnL</span>
+        <span class="metric-value mono ${rpnlCls}">${formatSignedUsd(metrics.realizedPnlUsd)}</span>
+      </div>
+    `;
+  }
+
+  if (tbodyEl) {
+    const rows = [
+      ...metrics.perps.map((p) => {
+        const pnlCls = p.uPnlUsd >= 0 ? "num-pos" : "num-neg";
+        const sideCls = p.side === "LONG" ? "tag-long" : "tag-short";
+        return `
+          <tr>
+            <td><span class="side-tag ${sideCls}">${p.side} ${p.leverage}x</span> <span class="mono strong">${escapeHtml(p.coin)}</span></td>
+            <td class="mono num">$${p.sizeUsd}</td>
+            <td class="mono num">$${formatPrice(p.entryPx)}&rarr;$${formatPrice(p.currentPx)}</td>
+            <td class="mono num ${pnlCls}">${formatSignedUsd(p.uPnlUsd)}<span class="pnl-pct"> (${formatSignedPct(p.roePct)})</span></td>
+            <td class="num"><button class="btn-inline" data-close-paper="${escapeHtml(p.id)}">Close</button></td>
+          </tr>
+        `;
+      }),
+      ...metrics.bets.map((b) => {
+        const pnlCls = b.uPnlUsd >= 0 ? "num-pos" : "num-neg";
+        const sideCls = b.outcome === "YES" ? "tag-long" : "tag-short";
+        return `
+          <tr>
+            <td><span class="side-tag ${sideCls}">PM ${b.outcome}</span> <span class="row-q">${escapeHtml(truncateAscii(b.question, 32))}</span></td>
+            <td class="mono num">$${b.stakeUsd}</td>
+            <td class="mono num">${b.entryOddsPct}%&rarr;${b.currentOddsPct}%</td>
+            <td class="mono num ${pnlCls}">${formatSignedUsd(b.uPnlUsd)}<span class="pnl-pct"> (${formatSignedPct(b.roiPct)})</span></td>
+            <td class="num"><button class="btn-inline" data-close-paper="${escapeHtml(b.id)}">Close</button></td>
+          </tr>
+        `;
+      }),
+    ];
+
+    tbodyEl.innerHTML = rows.length
+      ? rows.join("")
+      : `<tr><td colspan="5" class="empty-cell">No open paper orders yet. Click "Voice: Long BTC $100" or "Voice: Bet Yes $50 Fed", then Nod (N) or Tap (Enter).</td></tr>`;
+  }
 }
 
 function renderCompanion() {
@@ -1085,13 +1565,13 @@ function renderCompanion() {
   const badgeEl = document.getElementById("status-badges");
   if (badgeEl) {
     badgeEl.innerHTML = [
-      `<span class="pill ${state.bridgeMode === "EVENHUB" ? "pill-live" : "pill-sim"}">HOST: ${state.bridgeMode}</span>`,
-      `<span class="pill ${state.hlSource === "LIVE" ? "pill-live" : "pill-demo"}">HL: ${state.hlSource}</span>`,
-      `<span class="pill ${state.pmSource === "LIVE" ? "pill-live" : "pill-demo"}">PM: ${state.pmSource}</span>`,
-      `<span class="pill ${state.tgSource === "LIVE" ? "pill-live" : "pill-demo"}">TG: ${state.tgSource}</span>`,
-      `<span class="pill ${state.voiceRecording ? "pill-warn" : "pill-sim"}">MIC: ${state.voiceRecording ? "REC" : "IDLE"}</span>`,
-      `<span class="pill ${state.imuActive ? "pill-live" : "pill-sim"}">IMU: ${state.imuActive ? "ARMED" : "SLEEP"}</span>`,
-      `<span class="pill pill-sim">IN: ${escapeHtml(state.lastInputSource)}</span>`,
+      `<span class="pill ${state.bridgeMode === "EVENHUB" ? "pill-live" : "pill-neutral"}">HOST: ${state.bridgeMode}</span>`,
+      `<span class="pill ${state.hlSource === "LIVE" ? "pill-live" : "pill-neutral"}">HL ${state.hlNetwork === "testnet" ? "TEST" : "MAIN"}: ${state.hlSource}</span>`,
+      `<span class="pill ${state.walletSource === "LIVE" ? "pill-live" : state.walletSource === "ERROR" ? "pill-err" : "pill-neutral"}">WALLET: ${state.walletSource}</span>`,
+      `<span class="pill ${state.pmSource === "LIVE" ? "pill-live" : "pill-neutral"}">PM: ${state.pmSource}</span>`,
+      `<span class="pill ${state.tgSource === "LIVE" ? "pill-live" : "pill-neutral"}">TG: ${state.tgSource}</span>`,
+      `<span class="pill ${state.voiceRecording ? "pill-warn" : "pill-neutral"}">MIC: ${state.voiceRecording ? "REC" : "IDLE"}</span>`,
+      `<span class="pill ${state.imuActive ? "pill-accent" : "pill-neutral"}">IMU: ${state.imuActive ? "ARMED" : "SLEEP"}</span>`,
     ].join("");
   }
 
@@ -1102,13 +1582,31 @@ function renderCompanion() {
   const voiceBtn = document.getElementById("btn-voice");
   if (voiceBtn) {
     voiceBtn.textContent = state.voiceRecording ? "Stop Mic & Draft (V)" : "Hold/Toggle Mic (V)";
-    voiceBtn.classList.toggle("g-recording", state.voiceRecording);
+    voiceBtn.classList.toggle("btn-warn", state.voiceRecording);
   }
 
+  const hasPending = Boolean(state.pendingReply || state.pendingTrade);
   const nodBtn = document.getElementById("btn-nod");
   const shakeBtn = document.getElementById("btn-shake");
-  if (nodBtn) nodBtn.classList.toggle("g-primary", Boolean(state.pendingReply));
-  if (shakeBtn) shakeBtn.classList.toggle("g-warn", Boolean(state.pendingReply));
+  if (nodBtn) nodBtn.classList.toggle("btn-primary", hasPending);
+  if (shakeBtn) shakeBtn.classList.toggle("btn-danger-soft", hasPending);
+
+  const pendingBanner = document.getElementById("pending-banner");
+  if (pendingBanner) {
+    if (state.pendingTrade) {
+      pendingBanner.hidden = false;
+      pendingBanner.innerHTML = `<span class="pill pill-accent">ORDER TICKET READY</span> <strong>${escapeHtml(state.pendingTrade.summaryShort)}</strong> &mdash; Press <strong>IMU Head Nod (N)</strong> or <strong>Tap (Enter)</strong> to execute paper trade, or <strong>Shake (X)</strong> to cancel.`;
+    } else if (state.pendingReply) {
+      pendingBanner.hidden = false;
+      pendingBanner.innerHTML = `<span class="pill pill-accent">TELEGRAM DRAFT READY</span> To <strong>${escapeHtml(state.pendingReply.targetLabel)}</strong> &mdash; Press <strong>IMU Head Nod (N)</strong> or <strong>Tap (Enter)</strong> to send, or <strong>Shake (X)</strong> to cancel.`;
+    } else {
+      pendingBanner.hidden = true;
+      pendingBanner.innerHTML = "";
+    }
+  }
+
+  renderWalletSection();
+  renderPaperSection();
 
   const outboxEl = document.getElementById("tg-outbox");
   if (outboxEl) {
@@ -1116,10 +1614,10 @@ function renderCompanion() {
       ? state.outbox
           .map(
             (o) =>
-              `<li><span class="mono">[${o.time} ${o.mode}${o.replyTo ? ` #${o.replyTo}` : ""}]</span> ${escapeHtml(o.preview)}</li>`
+              `<li><span class="mono outbox-meta">[${o.time} ${o.mode}${o.replyTo ? ` #${o.replyTo}` : ""}]</span> ${escapeHtml(o.preview)}</li>`
           )
           .join("")
-      : `<li class="muted">No Telegram actions yet. Try "1-Click Voice Demo" then press Nod (N) or Tap (Enter).</li>`;
+      : `<li class="muted-item">No Telegram actions yet. Click "Voice: Telegram Reply" then press Nod (N) or Tap (Enter).</li>`;
   }
 
   const wireEl = document.getElementById("wire-log");
@@ -1134,70 +1632,175 @@ function mountShell() {
   root.innerHTML = `
     <div class="shell">
       <header class="topbar">
-        <div>
-          <h1>GlancePulse <span class="sub">v2.0 · Even Realities G2 Copilot</span></h1>
-          <p class="tagline">One thing that matters: entity-linked Telegram &times; Hyperliquid/Polymarket Focus Card with G2 Mic Voice Reply, 4-bit Grayscale Sparklines &amp; IMU Head-Nod Confirm.</p>
+        <div class="brand-group">
+          <div class="title-row">
+            <span class="title-accent" aria-hidden="true"></span>
+            <h1>GlancePulse</h1>
+            <span class="version-tag mono">v2.1 &middot; Even G2 Copilot</span>
+          </div>
+          <p class="tagline">Voice-first Even Realities G2 copilot: live Hyperliquid wallet &amp; perps, Polymarket odds, hands-free paper execution (no private keys), and threaded Telegram replies with 4-bit sparklines &amp; IMU Head-Nod confirm.</p>
         </div>
         <div id="status-badges" class="badges"></div>
       </header>
 
-      <main class="grid">
-        <section class="glasses-panel">
-          <div class="frame-header">
-            <span class="mono">EVEN G2 WAVEGUIDE &middot; 576&times;288 &middot; 4-BIT GREEN + SPARKLINE</span>
-            <div class="tab-bar">
-              ${SCREENS.map((s) => `<button class="tab-btn" data-tab="${s}">${s}</button>`).join("")}
+      <main class="layout-grid">
+        <section class="primary-col">
+          <div class="section-block">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title">Even G2 Optical Waveguide</h2>
+                <span class="mono meta-sub">576&times;288 &middot; 4-BIT MONOCHROME GREEN &middot; &le;26&times;3 BUDGET</span>
+              </div>
+              <div class="tab-bar" role="tablist">
+                ${SCREENS.map((s) => `<button class="tab-btn" data-tab="${s}">${s}</button>`).join("")}
+              </div>
+            </div>
+
+            <div class="waveguide-bezel">
+              <canvas id="g2-canvas" width="${G2_WIDTH}" height="${G2_HEIGHT}"></canvas>
+            </div>
+
+            <div id="pending-banner" class="pending-banner" hidden></div>
+
+            <div class="control-strip">
+              <span class="strip-label">G2 Hardware Controls</span>
+              <div class="btn-row">
+                <button id="btn-up" class="btn">Scroll Up (W)</button>
+                <button id="btn-down" class="btn">Scroll Down (S)</button>
+                <button id="btn-tap" class="btn btn-primary">Tap / Confirm (Enter)</button>
+                <button id="btn-voice" class="btn">Hold/Toggle Mic (V)</button>
+                <button id="btn-nod" class="btn">IMU Head Nod (N)</button>
+                <button id="btn-shake" class="btn">IMU Head Shake (X)</button>
+                <button id="btn-dtap" class="btn">2x Tap (D)</button>
+                <button id="btn-menu" class="btn">OS Menu (M)</button>
+                <button id="btn-source" class="btn">Input: R1 Ring</button>
+                <button id="btn-sync" class="btn">Sync Live (R)</button>
+              </div>
+            </div>
+
+            <div class="voice-demo-strip">
+              <div class="voice-demo-head">
+                <span class="strip-label">1-Click Voice-to-1-Tap Demos (No Hardware Needed)</span>
+                <span class="mono meta-sub">PCM16 WAVEFORM &rarr; G2 TICKET &rarr; NOD / TAP</span>
+              </div>
+              <div class="btn-row">
+                <button id="btn-voice-demo" class="btn btn-accent-soft">Voice: Telegram Reply</button>
+                ${VOICE_TRADE_PRESETS.map(
+                  (p) =>
+                    `<button class="btn btn-accent-soft" data-voice-trade="${escapeHtml(p.transcript)}" id="btn-preset-${p.id}">Voice: ${escapeHtml(p.label)}</button>`
+                ).join("")}
+              </div>
+              <div class="inline-cmd-row">
+                <input id="inp-voice-cmd" type="text" placeholder='Speak or type: "Long BTC 100", "Short ETH 250 5x", "Bet Yes 50 on Fed"...' autocomplete="off" />
+                <button id="btn-run-voice-cmd" class="btn btn-primary">Draft on G2</button>
+              </div>
             </div>
           </div>
 
-          <div class="waveguide-bezel">
-            <canvas id="g2-canvas" width="${G2_WIDTH}" height="${G2_HEIGHT}"></canvas>
-          </div>
+          <div class="section-block">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title">Paper Trading Portfolio</h2>
+                <span class="mono meta-sub">NON-CUSTODIAL &middot; ZERO PRIVATE KEYS &middot; LIVE MARK-TO-MARKET</span>
+              </div>
+              <button id="btn-reset-paper" class="btn btn-sm">Reset $10K</button>
+            </div>
 
-          <div class="gesture-deck">
-            <button id="btn-up" class="g-btn">Scroll Up (W)</button>
-            <button id="btn-down" class="g-btn">Scroll Down (S)</button>
-            <button id="btn-tap" class="g-btn g-primary">Tap / Confirm (Enter)</button>
-            <button id="btn-voice" class="g-btn">Hold/Toggle Mic (V)</button>
-            <button id="btn-voice-demo" class="g-btn g-accent">1-Click Voice Demo</button>
-            <button id="btn-nod" class="g-btn">IMU Head Nod (N)</button>
-            <button id="btn-shake" class="g-btn">IMU Head Shake (X)</button>
-            <button id="btn-dtap" class="g-btn">2x Tap: Next/Cancel (D)</button>
-            <button id="btn-menu" class="g-btn">OS Menu (M)</button>
-            <button id="btn-source" class="g-btn">Input: R1 Ring / Temple</button>
-            <button id="btn-sync" class="g-btn">Sync Live APIs (R)</button>
+            <div id="paper-metrics" class="metric-grid"></div>
+
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Position / Bet</th>
+                    <th class="num">Size</th>
+                    <th class="num">Entry/Live</th>
+                    <th class="num">uPnL</th>
+                    <th class="num">Action</th>
+                  </tr>
+                </thead>
+                <tbody id="paper-positions-body"></tbody>
+              </table>
+            </div>
           </div>
         </section>
 
-        <aside class="companion-panel">
-          <div class="card">
-            <h2>Telegram Read + Threaded Write</h2>
-            <p class="hint">Works out-of-the-box in Demo mode, or connect your BotFather token for live DM/Group/Channel reads &amp; threaded replies. In desktop browsers, optionally point CORS Proxy URL to your deployed <code>proxy/cloudflare-worker.js</code>.</p>
-            <label class="field">
-              <span>Bot Token</span>
-              <input id="inp-tg-token" type="password" placeholder="123456:ABC-DEF..." autocomplete="off" />
-            </label>
-            <label class="field">
-              <span>Chat ID (optional — auto-detected from getUpdates)</span>
-              <input id="inp-tg-chat" type="text" placeholder="e.g. 582910344" autocomplete="off" />
-            </label>
-            <label class="field">
-              <span>CORS Proxy URL (optional for desktop browser)</span>
-              <input id="inp-tg-proxy" type="url" placeholder="https://your-worker.workers.dev" autocomplete="off" />
-            </label>
-            <div class="row-actions">
-              <button id="btn-save-tg" class="g-btn g-primary">Save &amp; Sync Telegram</button>
-              <button id="btn-inject-msg" class="g-btn">Simulate Desk Msg</button>
+        <aside class="companion-col">
+          <div class="section-block">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title">Live Hyperliquid Watch Wallet</h2>
+                <span class="mono meta-sub">PUBLIC CLEARINGHOUSESTATE &middot; READ-ONLY</span>
+              </div>
+              <div class="seg-group">
+                <button class="seg-btn active" data-hl-net="mainnet">Mainnet</button>
+                <button class="seg-btn" data-hl-net="testnet">Testnet</button>
+              </div>
+            </div>
+
+            <div class="wallet-input-row">
+              <input id="inp-wallet-addr" type="text" placeholder="0x... Hyperliquid trader address" autocomplete="off" />
+              <button id="btn-fetch-wallet" class="btn btn-primary">Fetch</button>
+              <button id="btn-preset-wallet" class="btn">Live Preset</button>
+            </div>
+
+            <div id="wallet-status-note" class="status-line"></div>
+            <div id="wallet-metrics" class="metric-grid"></div>
+
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Coin</th>
+                    <th>Side</th>
+                    <th class="num">Notional</th>
+                    <th class="num">Entry</th>
+                    <th class="num">uPnL</th>
+                  </tr>
+                </thead>
+                <tbody id="wallet-positions-body"></tbody>
+              </table>
             </div>
           </div>
 
-          <div class="card">
-            <h2>Dispatched Threaded Telegram Actions</h2>
-            <ul id="tg-outbox" class="outbox"></ul>
+          <div class="section-block">
+            <div class="section-head">
+              <div>
+                <h2 class="section-title">Telegram Read + Threaded Write</h2>
+                <span class="mono meta-sub">TRACK 1 &middot; BOT / CHANNEL SYNC &middot; ZERO HARDCODED SECRETS</span>
+              </div>
+            </div>
+            <p class="hint">Works immediately in Demo mode, or connect your BotFather token for live DM/Group/Channel sync &amp; threaded replies. In desktop browsers, optionally point CORS Proxy URL to <code>proxy/cloudflare-worker.js</code>.</p>
+            <div class="form-stack">
+              <label class="field">
+                <span>Bot Token</span>
+                <input id="inp-tg-token" type="password" placeholder="123456:ABC-DEF..." autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>Chat ID (optional &mdash; auto-detected from getUpdates)</span>
+                <input id="inp-tg-chat" type="text" placeholder="e.g. 582910344" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>CORS Proxy URL (optional for desktop browser)</span>
+                <input id="inp-tg-proxy" type="url" placeholder="https://your-worker.workers.dev" autocomplete="off" />
+              </label>
+            </div>
+            <div class="btn-row">
+              <button id="btn-save-tg" class="btn btn-primary">Save &amp; Sync Telegram</button>
+              <button id="btn-inject-msg" class="btn">Simulate Desk Msg</button>
+            </div>
+
+            <div class="subsection">
+              <h3 class="subsection-title">Dispatched Threaded Actions</h3>
+              <ul id="tg-outbox" class="outbox"></ul>
+            </div>
           </div>
 
-          <div class="card">
-            <h2>EvenHub SDK Wire Log (Serialized BLE)</h2>
+          <div class="section-block section-last">
+            <div class="section-head">
+              <h2 class="section-title">EvenHub SDK Wire Log</h2>
+              <span class="mono meta-sub">SERIALIZED BLE QUEUE</span>
+            </div>
             <pre id="wire-log" class="wire-log"></pre>
           </div>
         </aside>
@@ -1216,6 +1819,24 @@ function mountShell() {
     else startVoiceCapture(state.lastInputSource);
   });
   document.getElementById("btn-voice-demo")?.addEventListener("click", () => runSimulatedVoiceDemo());
+  document.querySelectorAll("[data-voice-trade]").forEach((btn) => {
+    btn.addEventListener("click", () => runSimulatedVoiceDemo(btn.dataset.voiceTrade));
+  });
+  document.getElementById("btn-run-voice-cmd")?.addEventListener("click", () => {
+    const inp = document.getElementById("inp-voice-cmd");
+    if (!inp) return;
+    const text = inp.value.trim();
+    if (!text) return;
+    inp.value = "";
+    submitVoiceCommandText(text);
+  });
+  document.getElementById("inp-voice-cmd")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      document.getElementById("btn-run-voice-cmd")?.click();
+    }
+  });
+
   document.getElementById("btn-nod")?.addEventListener("click", () => simulateImuGesture("NOD"));
   document.getElementById("btn-shake")?.addEventListener("click", () => simulateImuGesture("SHAKE"));
   document.getElementById("btn-dtap")?.addEventListener("click", () => handleDoubleTap());
@@ -1224,14 +1845,77 @@ function mountShell() {
     state.menuIndex = 0;
     renderCompanion();
   });
-  document.getElementById("btn-source")?.addEventListener("click", () => {
+  document.getElementById("btn-source")?.addEventListener("click", (e) => {
     const order = ["R1 RING", "R-TEMPLE", "L-TEMPLE"];
     const next = order[(order.indexOf(state.lastInputSource) + 1) % order.length];
     state.lastInputSource = next;
+    e.currentTarget.textContent = `Input: ${next}`;
     logWire("input.source", `switched to ${next}`);
     renderCompanion();
   });
   document.getElementById("btn-sync")?.addEventListener("click", () => refreshAllFeeds(true));
+  document.getElementById("btn-reset-paper")?.addEventListener("click", () => resetPaperBook());
+
+  // Hyperliquid Mainnet / Testnet toggle + Wallet lookup
+  document.querySelectorAll("[data-hl-net]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const nextNet = btn.dataset.hlNet === "testnet" ? "testnet" : "mainnet";
+      if (state.hlNetwork === nextNet) return;
+      const wasMainPreset = state.walletAddress.toLowerCase() === PRESET_WALLETS.mainnet.address.toLowerCase();
+      const wasTestPreset = state.walletAddress.toLowerCase() === PRESET_WALLETS.testnet.address.toLowerCase();
+      state.hlNetwork = nextNet;
+      if (wasMainPreset || wasTestPreset || !isValidEvmAddress(state.walletAddress)) {
+        state.walletAddress = PRESET_WALLETS[nextNet].address;
+        const wInp = document.getElementById("inp-wallet-addr");
+        if (wInp) wInp.value = state.walletAddress;
+      }
+      await saveConfig();
+      await refreshHyperliquidNetwork(true);
+    });
+  });
+
+  document.getElementById("btn-fetch-wallet")?.addEventListener("click", async () => {
+    const wInp = document.getElementById("inp-wallet-addr");
+    state.walletAddress = wInp?.value.trim() || "";
+    await saveConfig();
+    state.screen = "WALLET";
+    state.selectedIndex = 0;
+    await refreshWalletData(true);
+  });
+
+  document.getElementById("btn-preset-wallet")?.addEventListener("click", async () => {
+    const preset = PRESET_WALLETS[state.hlNetwork] || PRESET_WALLETS.mainnet;
+    state.walletAddress = preset.address;
+    const wInp = document.getElementById("inp-wallet-addr");
+    if (wInp) wInp.value = preset.address;
+    await saveConfig();
+    state.screen = "WALLET";
+    state.selectedIndex = 0;
+    await refreshWalletData(true);
+  });
+
+  // Event delegation for Paper Position Close & Live HL Position inspect
+  document.getElementById("paper-positions-body")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-close-paper]");
+    if (btn) {
+      closePaperById(btn.dataset.closePaper);
+    }
+  });
+
+  document.getElementById("wallet-positions-body")?.addEventListener("click", async (e) => {
+    const row = e.target.closest("[data-hl-pos-idx]");
+    if (!row) return;
+    const posIdx = Number(row.dataset.hlPosIdx);
+    const pos = state.walletData?.allTopPositions?.[posIdx];
+    if (!pos) return;
+    await ensureCandlesForCoin(pos.coin);
+    state.screen = "WALLET";
+    const entries = buildWalletListEntries(state);
+    const matchIdx = entries.findIndex((en) => en.kind === "HL_POS" && en.item?.coin === pos.coin);
+    state.selectedIndex = matchIdx >= 0 ? matchIdx : 0;
+    await syncFullPage();
+  });
+
   document.getElementById("btn-save-tg")?.addEventListener("click", async () => {
     const prevToken = state.tgToken;
     state.tgToken = document.getElementById("inp-tg-token")?.value.trim() || "";
@@ -1273,6 +1957,7 @@ function mountShell() {
     state.messageIndex = 0;
     state.selectedIndex = 0;
     state.pendingReply = null;
+    state.pendingTrade = null;
     await setImuListening(false);
     logWire("telegram.in", `[${msg.kind}] ${msg.from}: ${msg.text.slice(0, 36)}`);
     await syncFullPage();
@@ -1327,12 +2012,10 @@ async function detectEvenBridge() {
       new Promise((_, reject) => setTimeout(() => reject(new Error("bridge timeout")), 1800)),
     ]);
 
-    // Allow brief window for async flutter_inappwebview / simulator handler attachment
     if (!window.flutter_inappwebview?.callHandler) {
       await new Promise((resolve) => setTimeout(resolve, 180));
     }
 
-    // Verify native/simulator handler responds cleanly (getDeviceInfo returns null when no host exists)
     const hasNativeHost = Boolean(window.flutter_inappwebview?.callHandler);
     const info = await Promise.race([
       bridge.getDeviceInfo(),
@@ -1388,9 +2071,11 @@ async function boot() {
   const tokenInp = document.getElementById("inp-tg-token");
   const chatInp = document.getElementById("inp-tg-chat");
   const proxyInp = document.getElementById("inp-tg-proxy");
+  const walletInp = document.getElementById("inp-wallet-addr");
   if (tokenInp && state.tgToken) tokenInp.value = state.tgToken;
   if (chatInp && state.tgChatId) chatInp.value = state.tgChatId;
   if (proxyInp && state.tgProxyUrl) proxyInp.value = state.tgProxyUrl;
+  if (walletInp && state.walletAddress) walletInp.value = state.walletAddress;
 
   await syncFullPage();
   await refreshAllFeeds(false);

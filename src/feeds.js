@@ -1,10 +1,38 @@
 /**
- * Live data feeds, entity auto-linker, and threaded Telegram Bot/Channel connector
- * for GlancePulse G2 v2.0.
+ * Live data feeds, read-only Hyperliquid wallet reader (`clearinghouseState`),
+ * entity auto-linker, and threaded Telegram Bot/Channel connector
+ * for GlancePulse G2 v2.1.
  *
- * Zero hardcoded secrets: Bot token, chat ID, and optional CORS proxy URL are
- * configured at runtime and persisted strictly in EvenHub / browser localStorage.
+ * Zero hardcoded secrets or private keys: Bot token, chat ID, optional CORS proxy,
+ * and read-only watch wallet address are configured at runtime and persisted
+ * strictly in EvenHub / browser localStorage.
  */
+
+export const HYPERLIQUID_ENDPOINTS = {
+  mainnet: "https://api.hyperliquid.xyz/info",
+  testnet: "https://api.hyperliquid-testnet.xyz/info",
+};
+
+export const PRESET_WALLETS = {
+  mainnet: {
+    address: "0x010461c14e146ac35fe42271bdc1134ee31c703a",
+    label: "HLP Strategy A (Mainnet)",
+  },
+  testnet: {
+    address: "0x768484f7e2ebb675c57838366c02ae99ba2a9b08",
+    label: "HLP Strategy (Testnet)",
+  },
+};
+
+export function isValidEvmAddress(addr) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(addr ?? "").trim());
+}
+
+export function resolveHyperliquidUrl(network = "mainnet") {
+  return String(network).toLowerCase() === "testnet"
+    ? HYPERLIQUID_ENDPOINTS.testnet
+    : HYPERLIQUID_ENDPOINTS.mainnet;
+}
 
 export const FALLBACK_POLYMARKET = [
   {
@@ -311,11 +339,11 @@ export async function fetchPolymarketMarkets(fetchImpl = globalThis.fetch, nowMs
 }
 
 /**
- * Fetch live Hyperliquid perpetuals with graceful fallback.
+ * Fetch live Hyperliquid perpetuals (mainnet or testnet) with graceful fallback.
  */
-export async function fetchHyperliquidPerps(fetchImpl = globalThis.fetch) {
+export async function fetchHyperliquidPerps(fetchImpl = globalThis.fetch, { network = "mainnet" } = {}) {
   try {
-    const res = await fetchImpl("https://api.hyperliquid.xyz/info", {
+    const res = await fetchImpl(resolveHyperliquidUrl(network), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ type: "metaAndAssetCtxs" }),
@@ -325,21 +353,26 @@ export async function fetchHyperliquidPerps(fetchImpl = globalThis.fetch) {
     const data = await res.json();
     const parsed = parseHyperliquidResponse(data);
     if (parsed.length > 0) {
-      return { source: "LIVE", perps: parsed, fetchedAt: Date.now() };
+      return { source: "LIVE", network, perps: parsed, fetchedAt: Date.now() };
     }
     throw new Error("Empty Hyperliquid response");
   } catch (err) {
-    return { source: "DEMO", perps: FALLBACK_HYPERLIQUID, fetchedAt: Date.now(), error: err?.message };
+    return { source: "DEMO", network, perps: FALLBACK_HYPERLIQUID, fetchedAt: Date.now(), error: err?.message };
   }
 }
 
 /**
  * Fetch live 24h hourly close prices for a Hyperliquid coin via `candleSnapshot`.
  */
-export async function fetchHyperliquidCandles(coin, fetchImpl = globalThis.fetch, nowMs = Date.now()) {
+export async function fetchHyperliquidCandles(
+  coin,
+  fetchImpl = globalThis.fetch,
+  nowMs = Date.now(),
+  { network = "mainnet" } = {}
+) {
   const sym = String(coin || "BTC").toUpperCase();
   try {
-    const res = await fetchImpl("https://api.hyperliquid.xyz/info", {
+    const res = await fetchImpl(resolveHyperliquidUrl(network), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -366,6 +399,132 @@ export async function fetchHyperliquidCandles(coin, fetchImpl = globalThis.fetch
       source: "DEMO",
       coin: sym,
       closes: FALLBACK_CANDLES[sym] || FALLBACK_CANDLES.BTC,
+    };
+  }
+}
+
+/**
+ * Parse public zero-auth Hyperliquid `clearinghouseState` payload into normalized
+ * account equity, margin, withdrawable cash, and sorted open perpetual positions.
+ */
+export function parseClearinghouseState(
+  raw,
+  { address = "", network = "mainnet", topN = 6 } = {}
+) {
+  if (!raw || typeof raw !== "object") return null;
+  const ms = raw.marginSummary || raw.crossMarginSummary;
+  if (!ms || typeof ms !== "object") return null;
+
+  const accountValue = Number(ms.accountValue ?? 0);
+  const totalMarginUsed = Number(ms.totalMarginUsed ?? 0);
+  const totalNtlPos = Number(ms.totalNtlPos ?? 0);
+  const withdrawable = Number(raw.withdrawable ?? 0);
+  if (!Number.isFinite(accountValue)) return null;
+
+  const rawPositions = Array.isArray(raw.assetPositions) ? raw.assetPositions : [];
+  const parsedPositions = [];
+  let totalUnrealizedPnl = 0;
+
+  for (const item of rawPositions) {
+    const pos = item?.position;
+    if (!pos || !pos.coin) continue;
+    const szi = Number(pos.szi ?? 0);
+    if (!Number.isFinite(szi) || Math.abs(szi) < 1e-12) continue;
+
+    const entryPx = Number(pos.entryPx ?? 0);
+    const positionValue = Math.abs(Number(pos.positionValue ?? 0));
+    const unrealizedPnl = Number(pos.unrealizedPnl ?? 0);
+    const roePct = Number(pos.returnOnEquity ?? 0) * 100;
+    const leverage = Number(pos.leverage?.value ?? 1);
+    const marginUsed = Number(pos.marginUsed ?? 0);
+    const liqRaw = pos.liquidationPx != null ? Number(pos.liquidationPx) : null;
+    const liquidationPx = Number.isFinite(liqRaw) && liqRaw > 0 ? liqRaw : null;
+
+    if (Number.isFinite(unrealizedPnl)) {
+      totalUnrealizedPnl += unrealizedPnl;
+    }
+
+    parsedPositions.push({
+      coin: String(pos.coin),
+      szi,
+      side: szi > 0 ? "LONG" : "SHORT",
+      sizeAbs: Math.abs(szi),
+      entryPx: Number.isFinite(entryPx) ? entryPx : 0,
+      positionValue: Number.isFinite(positionValue) ? positionValue : 0,
+      unrealizedPnl: Number.isFinite(unrealizedPnl) ? Number(unrealizedPnl.toFixed(2)) : 0,
+      roePct: Number.isFinite(roePct) ? Number(roePct.toFixed(1)) : 0,
+      leverage: Number.isFinite(leverage) && leverage > 0 ? Math.round(leverage) : 1,
+      marginUsed: Number.isFinite(marginUsed) ? Number(marginUsed.toFixed(2)) : 0,
+      liquidationPx,
+    });
+  }
+
+  parsedPositions.sort((a, b) => b.positionValue - a.positionValue);
+  const cleanAddr = String(address || "").trim();
+  const shortAddress = cleanAddr.length >= 12 ? `${cleanAddr.slice(0, 6)}...${cleanAddr.slice(-4)}` : cleanAddr;
+  const marginRatioPct =
+    accountValue > 0 ? Number(((totalMarginUsed / accountValue) * 100).toFixed(1)) : 0;
+
+  return {
+    address: cleanAddr,
+    shortAddress,
+    network: String(network).toLowerCase() === "testnet" ? "testnet" : "mainnet",
+    accountValue: Number(accountValue.toFixed(2)),
+    totalMarginUsed: Number((Number.isFinite(totalMarginUsed) ? totalMarginUsed : 0).toFixed(2)),
+    totalNtlPos: Number((Number.isFinite(totalNtlPos) ? totalNtlPos : 0).toFixed(2)),
+    withdrawable: Number((Number.isFinite(withdrawable) ? withdrawable : 0).toFixed(2)),
+    marginRatioPct,
+    totalUnrealizedPnl: Number(totalUnrealizedPnl.toFixed(2)),
+    totalPositionCount: parsedPositions.length,
+    positions: parsedPositions.slice(0, topN),
+    allTopPositions: parsedPositions.slice(0, 12),
+  };
+}
+
+/**
+ * Query public zero-auth Hyperliquid `clearinghouseState` (mainnet or testnet).
+ * Never fabricates balances or positions on failure.
+ */
+export async function fetchHyperliquidWallet(
+  { address = "", network = "mainnet" } = {},
+  fetchImpl = globalThis.fetch
+) {
+  const cleanAddr = String(address || "").trim();
+  const net = String(network).toLowerCase() === "testnet" ? "testnet" : "mainnet";
+  if (!isValidEvmAddress(cleanAddr)) {
+    return {
+      source: "INVALID",
+      network: net,
+      wallet: null,
+      fetchedAt: Date.now(),
+      error: "Enter a valid 42-char 0x... EVM address",
+    };
+  }
+
+  try {
+    const res = await fetchImpl(resolveHyperliquidUrl(net), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "clearinghouseState", user: cleanAddr }),
+      signal: AbortSignal.timeout(6500),
+    });
+    if (!res.ok) throw new Error(`Hyperliquid HTTP ${res.status}`);
+    const data = await res.json();
+    const wallet = parseClearinghouseState(data, { address: cleanAddr, network: net });
+    if (!wallet) throw new Error("Malformed clearinghouseState response");
+    return {
+      source: "LIVE",
+      network: net,
+      wallet,
+      fetchedAt: Date.now(),
+    };
+  } catch (err) {
+    return {
+      source: "ERROR",
+      network: net,
+      wallet: null,
+      fetchedAt: Date.now(),
+      error: err?.message || "Wallet fetch failed",
     };
   }
 }
