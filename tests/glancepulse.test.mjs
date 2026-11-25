@@ -47,7 +47,12 @@ import {
   deriveToastHeading,
 } from "../src/g2-layout.js";
 import { parseTelegramProxyPath } from "../proxy/cloudflare-worker.js";
-import { getControllerState, handleSdkEvent, submitVoiceCommandText } from "../src/main.js";
+import {
+  autoFetchInitialWallet,
+  getControllerState,
+  handleSdkEvent,
+  submitVoiceCommandText,
+} from "../src/main.js";
 import {
   SPARK_IMG_HEIGHT,
   SPARK_IMG_WIDTH,
@@ -1021,5 +1026,69 @@ test("22. On-device push-to-talk fallback without Web Speech marks DEMO_FALLBACK
     st.toastTimer = null;
   }
 });
+
+test("23. Silent initial wallet auto-fetch populates live Mainnet preset equity and falls back cleanly on timeout/error", async () => {
+  const st = getControllerState();
+  st.hlNetwork = "mainnet";
+  st.walletAddress = PRESET_WALLETS.mainnet.address;
+  st.walletSource = "IDLE";
+  st.walletData = null;
+  st.walletError = "";
+  st.walletIdleHint = "";
+
+  // 1) Network failure / timeout on silent initial mount -> preserves clean empty state with "Live (click to fetch)"
+  const failRes = await autoFetchInitialWallet({
+    fetchImpl: async () => {
+      throw new Error("AbortError: timeout");
+    },
+  });
+  assert.equal(failRes?.source, "ERROR");
+  assert.equal(st.walletSource, "IDLE");
+  assert.equal(st.walletData, null);
+  assert.equal(st.walletError, "");
+  assert.equal(st.walletIdleHint, "Live (click to fetch)");
+
+  // 2) Live clearinghouseState response -> populates real equity & open positions without error banner
+  let capturedBody = null;
+  const liveRes = await autoFetchInitialWallet({
+    fetchImpl: async (_url, opts) => {
+      capturedBody = JSON.parse(opts.body);
+      return {
+        ok: true,
+        json: async () => ({
+          marginSummary: {
+            accountValue: "3171586.24",
+            totalNtlPos: "2776518.00",
+            totalMarginUsed: "138825.90",
+          },
+          withdrawable: "2893934.43",
+          assetPositions: [
+            {
+              type: "oneWay",
+              position: {
+                coin: "BTC",
+                szi: "0.25",
+                leverage: { type: "cross", value: 10 },
+                entryPx: "95000",
+                positionValue: "24100",
+                unrealizedPnl: "355.12",
+                returnOnEquity: "0.147",
+                marginUsed: "2410",
+              },
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(capturedBody?.type, "clearinghouseState");
+  assert.equal(capturedBody?.user, PRESET_WALLETS.mainnet.address);
+  assert.equal(liveRes?.source, "LIVE");
+  assert.equal(st.walletSource, "LIVE");
+  assert.equal(st.walletData?.accountValue, 3171586.24);
+  assert.equal(st.walletData?.totalPositionCount, 1);
+  assert.equal(st.walletIdleHint, "");
+});
+
 
 

@@ -127,6 +127,7 @@ const state = {
   walletSource: "IDLE", // "IDLE" | "LIVE" | "ERROR" | "INVALID"
   walletData: null,
   walletError: "",
+  walletIdleHint: "",
   // Non-custodial paper perp & Polymarket bet ledger
   paperBook: createDefaultPaperBook(),
   // Voice & IMU confirmation loop (handles BOTH Telegram reply & Crypto/DeFi paper trade)
@@ -435,10 +436,10 @@ function nextMessage() {
   syncFullPage();
 }
 
-async function ensureCandlesForCoin(coin) {
+async function ensureCandlesForCoin(coin, fetchImpl = globalThis.fetch) {
   const sym = String(coin || "").toUpperCase();
   if (!sym || state.candlesByCoin[sym]) return;
-  const c = await fetchHyperliquidCandles(sym, globalThis.fetch, Date.now(), { network: state.hlNetwork });
+  const c = await fetchHyperliquidCandles(sym, fetchImpl, Date.now(), { network: state.hlNetwork });
   state.candlesByCoin[c.coin] = c.closes;
 }
 
@@ -692,6 +693,7 @@ async function refreshWalletData(notify = false) {
   const seq = ++walletRefreshSeq;
   const net = state.hlNetwork;
   const addr = String(state.walletAddress || "").trim();
+  state.walletIdleHint = "";
   if (!addr) {
     state.walletSource = "IDLE";
     state.walletData = null;
@@ -737,6 +739,46 @@ async function refreshWalletData(notify = false) {
   await syncFullPage();
 }
 
+/**
+ * Silently auto-fetch the configured/Live Preset Hyperliquid wallet once on initial
+ * browser mount so the first screen renders real clearinghouseState equity & positions
+ * without blocking on slower feeds. On network error/timeout, preserves clean empty
+ * state with "Live (click to fetch)" instead of flashing an error banner.
+ */
+export async function autoFetchInitialWallet({ fetchImpl = globalThis.fetch } = {}) {
+  const net = state.hlNetwork;
+  const addr = String(state.walletAddress || PRESET_WALLETS[net]?.address || "").trim();
+  if (!isValidEvmAddress(addr)) return null;
+  state.walletAddress = addr;
+  const seq = ++walletRefreshSeq;
+
+  const res = await fetchHyperliquidWallet({ address: addr, network: net }, fetchImpl);
+  if (seq !== walletRefreshSeq || state.hlNetwork !== net) return null;
+
+  if (res.source === "LIVE" && res.wallet) {
+    state.walletSource = "LIVE";
+    state.walletData = res.wallet;
+    state.walletError = "";
+    state.walletIdleHint = "";
+    logWire(
+      "hl.wallet",
+      `${res.network.toUpperCase()} ${res.wallet.shortAddress} eq=${formatCompactUsd(res.wallet.accountValue)} pos=${res.wallet.totalPositionCount}`
+    );
+    const firstCoin = res.wallet.positions?.[0]?.coin;
+    if (firstCoin) {
+      ensureCandlesForCoin(firstCoin, fetchImpl).catch(() => {});
+    }
+  } else if (!state.walletData) {
+    state.walletSource = "IDLE";
+    state.walletError = "";
+    state.walletIdleHint = "Live (click to fetch)";
+    logWire("hl.wallet.idle", "Silent initial fetch deferred — Live (click to fetch)");
+  }
+
+  await syncIncrementalUpdate({ includeImage: true });
+  return res;
+}
+
 async function refreshHyperliquidNetwork(notify = true) {
   const hSeq = ++hlRefreshSeq;
   const wSeq = ++walletRefreshSeq;
@@ -746,6 +788,7 @@ async function refreshHyperliquidNetwork(notify = true) {
   state.walletSource = isValidEvmAddress(addr) ? "LOADING" : "IDLE";
   state.walletData = null;
   state.walletError = "";
+  state.walletIdleHint = "";
   renderCompanion();
 
   const [hl, btcCandles, walletRes] = await Promise.all([
@@ -1222,10 +1265,10 @@ async function handleMenuAction(itemID) {
   }
 }
 
-async function refreshAllFeeds(notify = false) {
+async function refreshAllFeeds(notify = false, { includeWallet = true } = {}) {
   const seq = ++feedRefreshSeq;
   const hSeq = ++hlRefreshSeq;
-  const wSeq = ++walletRefreshSeq;
+  const wSeq = includeWallet ? ++walletRefreshSeq : walletRefreshSeq;
   const net = state.hlNetwork;
   const addr = String(state.walletAddress || "").trim();
 
@@ -1235,8 +1278,52 @@ async function refreshAllFeeds(notify = false) {
       ? state.perps[state.selectedIndex]?.coin || "BTC"
       : activeCtx.perp?.coin || "BTC";
 
-  const [hl, pm, tg, activeCandles, btcCandles, walletRes] = await Promise.all([
+  // Apply fast Hyperliquid feeds progressively so slow Polymarket responses never stall first paint
+  const hlFastPromise = Promise.all([
     fetchHyperliquidPerps(globalThis.fetch, { network: net }),
+    fetchHyperliquidCandles(activeCoin, globalThis.fetch, Date.now(), { network: net }),
+    activeCoin === "BTC"
+      ? Promise.resolve(null)
+      : fetchHyperliquidCandles("BTC", globalThis.fetch, Date.now(), { network: net }),
+    includeWallet && isValidEvmAddress(addr)
+      ? fetchHyperliquidWallet({ address: addr, network: net })
+      : Promise.resolve(null),
+  ]).then(async ([hl, activeCandles, btcCandles, walletRes]) => {
+    let updated = false;
+    if (hSeq === hlRefreshSeq && state.hlNetwork === net) {
+      state.hlSource = hl.source;
+      state.perps = hl.perps;
+      state.candlesByCoin[activeCandles.coin] = activeCandles.closes;
+      if (btcCandles) state.candlesByCoin[btcCandles.coin] = btcCandles.closes;
+      updated = true;
+    }
+
+    if (includeWallet && walletRes && wSeq === walletRefreshSeq && state.hlNetwork === net) {
+      if (walletRes.source === "LIVE" && walletRes.wallet) {
+        state.walletSource = "LIVE";
+        state.walletData = walletRes.wallet;
+        state.walletError = "";
+        state.walletIdleHint = "";
+      } else if (notify || state.walletData) {
+        state.walletSource = walletRes.source;
+        state.walletData = walletRes.wallet;
+        state.walletError = walletRes.error || "";
+      } else {
+        state.walletSource = "IDLE";
+        state.walletError = "";
+        state.walletIdleHint = "Live (click to fetch)";
+      }
+      updated = true;
+    }
+
+    if (updated) {
+      await syncIncrementalUpdate({ includeImage: true });
+    }
+    return [hl, activeCandles, btcCandles, walletRes];
+  });
+
+  const [, pm, tg] = await Promise.all([
+    hlFastPromise,
     fetchPolymarketMarkets(),
     fetchTelegramInbox({
       botToken: state.tgToken,
@@ -1244,28 +1331,7 @@ async function refreshAllFeeds(notify = false) {
       offset: state.tgOffset,
       proxyUrl: state.tgProxyUrl,
     }),
-    fetchHyperliquidCandles(activeCoin, globalThis.fetch, Date.now(), { network: net }),
-    activeCoin === "BTC"
-      ? Promise.resolve(null)
-      : fetchHyperliquidCandles("BTC", globalThis.fetch, Date.now(), { network: net }),
-    isValidEvmAddress(addr)
-      ? fetchHyperliquidWallet({ address: addr, network: net })
-      : Promise.resolve(null),
   ]);
-
-  // Guard against stale responses if user triggered a newer refresh or network toggle
-  if (hSeq === hlRefreshSeq && state.hlNetwork === net) {
-    state.hlSource = hl.source;
-    state.perps = hl.perps;
-    state.candlesByCoin[activeCandles.coin] = activeCandles.closes;
-    if (btcCandles) state.candlesByCoin[btcCandles.coin] = btcCandles.closes;
-  }
-
-  if (walletRes && wSeq === walletRefreshSeq && state.hlNetwork === net) {
-    state.walletSource = walletRes.source;
-    state.walletData = walletRes.wallet;
-    state.walletError = walletRes.error || "";
-  }
 
   if (seq !== feedRefreshSeq) return;
 
@@ -1469,7 +1535,8 @@ function renderWalletSection() {
     } else if (state.walletSource === "ERROR" || state.walletSource === "INVALID") {
       statusEl.innerHTML = `<span class="pill pill-err">${escapeHtml(state.walletSource)}</span> <span class="muted-inline">${escapeHtml(state.walletError || "Unable to fetch wallet")}</span>`;
     } else {
-      statusEl.innerHTML = `<span class="pill pill-neutral">READY</span> <span class="muted-inline">Zero private keys &middot; public read-only query</span>`;
+      const idleCopy = state.walletIdleHint || "Zero private keys · public read-only query";
+      statusEl.innerHTML = `<span class="pill pill-neutral">READY</span> <span class="muted-inline">${escapeHtml(idleCopy)}</span>`;
     }
   }
 
@@ -1501,7 +1568,9 @@ function renderWalletSection() {
       tbodyEl.innerHTML = `<tr><td colspan="5" class="empty-cell">${
         state.walletSource === "LIVE"
           ? "No open perp positions on this address. Try 1-Click Live Preset."
-          : "Click Fetch or Load Live Preset to query real Hyperliquid positions."
+          : state.walletIdleHint
+            ? `${escapeHtml(state.walletIdleHint)} — click Fetch or Live Preset to query real Hyperliquid positions.`
+            : "Click Fetch or Load Live Preset to query real Hyperliquid positions."
       }</td></tr>`;
     } else {
       tbodyEl.innerHTML = positions
@@ -2173,7 +2242,8 @@ async function boot() {
   if (walletInp && state.walletAddress) walletInp.value = state.walletAddress;
 
   await syncFullPage();
-  await refreshAllFeeds(false);
+  autoFetchInitialWallet().catch(() => {});
+  await refreshAllFeeds(false, { includeWallet: false });
 
   setInterval(() => {
     refreshAllFeeds(false).catch(() => {});
