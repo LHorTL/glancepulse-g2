@@ -1,5 +1,5 @@
 /**
- * GlancePulse v2.1 Main Controller — Voice-First Crypto, DeFi & Telegram Copilot
+ * GlancePulse v2.1 Main Controller — Crypto, DeFi & Telegram Focus-Card Copilot
  * for Even Realities G2 Smart Glasses + Minimal-White Companion Console.
  *
  * Dual-mode architecture:
@@ -133,13 +133,14 @@ const state = {
   voiceRecording: false,
   voiceSpeakerRole: AudioSpeakerRole.Self,
   voiceTranscript: "",
+  voiceTranscriptSource: "IDLE", // "IDLE" | "WEB_SPEECH" | "DEMO_FALLBACK" | "TYPED"
   voiceSeconds: 0,
   voiceStartMs: 0,
   voiceTimer: null,
   audioLevels: new Array(16).fill(0.1),
   lastAudioGraphicMs: 0,
-  pendingReply: null, // { text, targetLabel, chatId, replyToMessageId, armAlert? }
-  pendingTrade: null, // parsed PAPER_PERP or PAPER_BET intent awaiting Nod / 1-Tap
+  pendingReply: null, // { text, targetLabel, chatId, replyToMessageId, armAlert?, transcriptSource? }
+  pendingTrade: null, // parsed PAPER_PERP or PAPER_BET intent awaiting Nod / 1-Tap (+ transcriptSource)
   imuActive: false,
   voicePresetIdx: 0,
   // UI & transport telemetry
@@ -401,10 +402,12 @@ async function switchScreen(nextScreen) {
   }
   if (state.pendingTrade) {
     state.pendingTrade = null;
+    state.voiceTranscriptSource = "IDLE";
     await setImuListening(false);
   }
   if ((nextScreen === "PERPS" || nextScreen === "MARKETS" || nextScreen === "WALLET") && state.pendingReply) {
     state.pendingReply = null;
+    state.voiceTranscriptSource = "IDLE";
     await setImuListening(false);
   }
   state.screen = nextScreen;
@@ -553,7 +556,7 @@ async function dispatchTelegram(text, { chatId = "", replyToMessageId = null, ta
   }
 }
 
-async function queueReplyForConfirmation(text, { armAlert = null } = {}) {
+async function queueReplyForConfirmation(text, { armAlert = null, transcriptSource = "SMART_REPLY" } = {}) {
   const msg = getActiveMessage(state);
   clearToast();
   state.pendingTrade = null;
@@ -563,6 +566,7 @@ async function queueReplyForConfirmation(text, { armAlert = null } = {}) {
     chatId: msg?.chatId || state.tgChatId,
     replyToMessageId: msg?.kind === "CHAT" && typeof msg?.id === "number" ? msg.id : null,
     armAlert,
+    transcriptSource,
   };
   state.selectedIndex = 0;
   await setImuListening(true);
@@ -573,6 +577,7 @@ async function confirmPendingReply(via = "TAP") {
   if (!state.pendingReply) return;
   const draft = state.pendingReply;
   state.pendingReply = null;
+  state.voiceTranscriptSource = "IDLE";
   await setImuListening(false);
   if (draft.armAlert) {
     await armAlertSpec(draft.armAlert);
@@ -588,6 +593,7 @@ async function confirmPendingReply(via = "TAP") {
 async function cancelPendingReply(via = "CANCEL", { skipSync = false } = {}) {
   if (!state.pendingReply) return;
   state.pendingReply = null;
+  state.voiceTranscriptSource = "IDLE";
   await setImuListening(false);
   logWire("cancel.reply", `via=${via}`);
   showToast(`Reply canceled (${via})`, 2400, { skipSync: true });
@@ -596,17 +602,21 @@ async function cancelPendingReply(via = "CANCEL", { skipSync = false } = {}) {
   }
 }
 
-async function queueTradeForConfirmation(intent) {
+async function queueTradeForConfirmation(intent, { transcriptSource = "TYPED", rawTranscript = "" } = {}) {
   clearToast();
   state.pendingReply = null;
-  state.pendingTrade = intent;
+  state.pendingTrade = {
+    ...intent,
+    transcriptSource,
+    rawTranscript: String(rawTranscript || intent?.raw || "").trim(),
+  };
   state.selectedIndex = 0;
   if (intent.kind === "PAPER_PERP") {
     ensureCandlesForCoin(intent.coin)
       .then(() => syncIncrementalUpdate({ includeImage: true }).catch(() => {}))
       .catch(() => {});
   }
-  logWire("trade.preview", `${intent.kind} ${intent.summaryShort}`);
+  logWire("trade.preview", `${intent.kind} ${intent.summaryShort}${transcriptSource === "DEMO_FALLBACK" ? " [DEMO TRANSCRIPT]" : ""}`);
   await setImuListening(true);
   await syncFullPage();
 }
@@ -615,6 +625,7 @@ async function confirmPendingTrade(via = "TAP") {
   if (!state.pendingTrade) return;
   const intent = state.pendingTrade;
   state.pendingTrade = null;
+  state.voiceTranscriptSource = "IDLE";
   await setImuListening(false);
 
   const res = executePaperIntent(state.paperBook, intent, Date.now());
@@ -645,6 +656,7 @@ async function confirmPendingTrade(via = "TAP") {
 async function cancelPendingTrade(via = "CANCEL", { skipSync = false } = {}) {
   if (!state.pendingTrade) return;
   state.pendingTrade = null;
+  state.voiceTranscriptSource = "IDLE";
   await setImuListening(false);
   logWire("cancel.trade", `via=${via}`);
   showToast(`Order canceled (${via})`, 2400, { skipSync: true });
@@ -762,6 +774,10 @@ async function refreshHyperliquidNetwork(notify = true) {
   await syncFullPage();
 }
 
+function hasBrowserSpeechSupport() {
+  return typeof window !== "undefined" && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
 function stopBrowserSpeech() {
   if (speechRecognition) {
     try {
@@ -777,9 +793,8 @@ function stopBrowserSpeech() {
 }
 
 function startBrowserSpeech() {
-  if (typeof window === "undefined") return false;
+  if (!hasBrowserSpeechSupport()) return false;
   const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRec) return false;
   try {
     stopBrowserSpeech();
     const rec = new SpeechRec();
@@ -793,11 +808,17 @@ function startBrowserSpeech() {
       }
       if (full.trim()) {
         state.voiceTranscript = full.trim();
+        state.voiceTranscriptSource = "WEB_SPEECH";
         syncIncrementalUpdate({ includeImage: true }).catch(() => {});
       }
     };
     rec.onerror = () => {
-      // Silently allow fallback preset transcript on release if browser mic denied
+      // Mark honest demo transcript fallback if browser mic is denied or unavailable
+      if (!state.voiceTranscript) {
+        state.voiceTranscriptSource = "DEMO_FALLBACK";
+        logWire("speech.api", "Web Speech unavailable — demo transcript fallback armed");
+        renderCompanion();
+      }
     };
     rec.start();
     speechRecognition = rec;
@@ -834,6 +855,7 @@ async function startVoiceCapture(
   clearVoiceTimers();
   state.voiceRecording = true;
   state.voiceTranscript = "";
+  state.voiceTranscriptSource = "DEMO_FALLBACK";
   state.voiceSpeakerRole = AudioSpeakerRole.Self;
   state.voiceSeconds = 0;
   state.voiceStartMs = Date.now();
@@ -850,8 +872,14 @@ async function startVoiceCapture(
   if (useBrowserSpeech) {
     const speechActive = startBrowserSpeech();
     if (speechActive) {
+      state.voiceTranscriptSource = "WEB_SPEECH";
       logWire("speech.api", "Web Speech dictation active");
+    } else {
+      state.voiceTranscriptSource = "DEMO_FALLBACK";
+      logWire("speech.api", "No browser Web Speech — push-to-talk demo transcript fallback");
     }
+  } else {
+    state.voiceTranscriptSource = "DEMO_FALLBACK";
   }
 
   state.voiceTimer = setInterval(() => {
@@ -875,6 +903,7 @@ async function startVoiceCapture(
 async function abortVoiceCapture({ skipSync = true } = {}) {
   if (!state.voiceRecording) return;
   state.voiceRecording = false;
+  state.voiceTranscriptSource = "IDLE";
   clearVoiceTimers();
   stopBrowserSpeech();
   logWire("audioControl", "ABORT");
@@ -892,7 +921,7 @@ async function abortVoiceCapture({ skipSync = true } = {}) {
   }
 }
 
-async function routeSpokenTranscript(transcript) {
+async function routeSpokenTranscript(transcript, { transcriptSource = "TYPED" } = {}) {
   const activeMarket =
     state.screen === "MARKETS"
       ? state.markets[state.selectedIndex] || state.markets[0]
@@ -905,16 +934,16 @@ async function routeSpokenTranscript(transcript) {
   });
 
   if (intent) {
-    await queueTradeForConfirmation(intent);
+    await queueTradeForConfirmation(intent, { transcriptSource, rawTranscript: transcript });
     return intent;
   }
 
   // Enrich conversational Telegram reply with "[G2 Voice]" provenance tag
-  await queueReplyForConfirmation(`[G2 Voice] ${transcript}`);
+  await queueReplyForConfirmation(`[G2 Voice] ${transcript}`, { transcriptSource });
   return null;
 }
 
-async function stopVoiceCapture({ forcedTranscript = "" } = {}) {
+async function stopVoiceCapture({ forcedTranscript = "", isDemoFallback = false } = {}) {
   if (!state.voiceRecording) return;
   state.voiceRecording = false;
   clearVoiceTimers();
@@ -928,7 +957,9 @@ async function stopVoiceCapture({ forcedTranscript = "" } = {}) {
   }
 
   let transcript = String(forcedTranscript || state.voiceTranscript || "").trim();
+  let usedDemoFallback = Boolean(isDemoFallback || state.voiceTranscriptSource === "DEMO_FALLBACK");
   if (!transcript) {
+    usedDemoFallback = true;
     if (state.screen === "WALLET" || state.screen === "PERPS") {
       const p = state.perps[state.selectedIndex] || state.perps[0];
       transcript = `Long ${p?.coin || "BTC"} 100`;
@@ -947,7 +978,13 @@ async function stopVoiceCapture({ forcedTranscript = "" } = {}) {
     }
   }
 
-  await routeSpokenTranscript(transcript);
+  const transcriptSource = usedDemoFallback ? "DEMO_FALLBACK" : "WEB_SPEECH";
+  state.voiceTranscriptSource = transcriptSource;
+  if (usedDemoFallback) {
+    logWire("voice.fallback", `DEMO TRANSCRIPT: ${truncateAscii(transcript, 44)}`);
+  }
+
+  await routeSpokenTranscript(transcript, { transcriptSource });
 }
 
 /**
@@ -991,7 +1028,7 @@ async function runSimulatedVoiceDemo(forcedCommand = "") {
       voiceDemoFinishTimer = setTimeout(() => {
         voiceDemoFinishTimer = null;
         if (state.voiceRecording) {
-          stopVoiceCapture({ forcedTranscript: preset }).catch(() => {});
+          stopVoiceCapture({ forcedTranscript: preset, isDemoFallback: true }).catch(() => {});
         }
       }, 280);
     }
@@ -1004,8 +1041,9 @@ export async function submitVoiceCommandText(commandText) {
   if (state.voiceRecording) {
     await abortVoiceCapture({ skipSync: true });
   }
+  state.voiceTranscriptSource = "TYPED";
   logWire("voice.cmd", truncateAscii(clean, 48));
-  return routeSpokenTranscript(clean);
+  return routeSpokenTranscript(clean, { transcriptSource: "TYPED" });
 }
 
 async function handlePrimaryTap() {
@@ -1084,7 +1122,9 @@ async function handlePrimaryTap() {
           : "";
       const baseText = state.pendingReply?.text || "[G2 Voice] Watching live desk flow";
       const nextText = tag && !baseText.includes(tag) ? `${baseText} ${tag}` : baseText;
-      await queueReplyForConfirmation(nextText);
+      await queueReplyForConfirmation(nextText, {
+        transcriptSource: state.pendingReply?.transcriptSource || "DEMO_FALLBACK",
+      });
     } else {
       await cancelPendingReply("EXIT", { skipSync: true });
       await switchScreen("FOCUS");
@@ -1594,14 +1634,66 @@ function renderCompanion() {
   const pendingBanner = document.getElementById("pending-banner");
   if (pendingBanner) {
     if (state.pendingTrade) {
+      const isDemo = state.pendingTrade.transcriptSource === "DEMO_FALLBACK";
+      const isWebSpeech = state.pendingTrade.transcriptSource === "WEB_SPEECH";
+      const sourceBadge = isDemo
+        ? `<span class="pill pill-demo-transcript" data-badge="demo-transcript">DEMO TRANSCRIPT</span>`
+        : isWebSpeech
+          ? `<span class="pill pill-live" data-badge="web-speech">WEB SPEECH</span>`
+          : "";
+      const quote =
+        isDemo && state.pendingTrade.rawTranscript
+          ? ` <span class="pending-transcript mono">&ldquo;${escapeHtml(truncateAscii(state.pendingTrade.rawTranscript, 56))}&rdquo;</span>`
+          : "";
       pendingBanner.hidden = false;
-      pendingBanner.innerHTML = `<span class="pill pill-accent">ORDER TICKET READY</span> <strong>${escapeHtml(state.pendingTrade.summaryShort)}</strong> &mdash; Press <strong>IMU Head Nod (N)</strong> or <strong>Tap (Enter)</strong> to execute paper trade, or <strong>Shake (X)</strong> to cancel.`;
+      pendingBanner.classList.toggle("pending-banner-demo", isDemo);
+      pendingBanner.innerHTML = `<span class="pill pill-accent">ORDER TICKET READY</span> ${sourceBadge} <strong>${escapeHtml(state.pendingTrade.summaryShort)}</strong>${quote} &mdash; Press <strong>IMU Head Nod (N)</strong> or <strong>Tap (Enter)</strong> to execute paper trade, or <strong>Shake (X)</strong> to cancel.`;
     } else if (state.pendingReply) {
+      const isDemo = state.pendingReply.transcriptSource === "DEMO_FALLBACK";
+      const isWebSpeech = state.pendingReply.transcriptSource === "WEB_SPEECH";
+      const sourceBadge = isDemo
+        ? `<span class="pill pill-demo-transcript" data-badge="demo-transcript">DEMO TRANSCRIPT</span>`
+        : isWebSpeech
+          ? `<span class="pill pill-live" data-badge="web-speech">WEB SPEECH</span>`
+          : "";
+      const preview = String(state.pendingReply.text || "").replace(/^\[G2(?: Voice)?\]\s*/i, "");
+      const quote =
+        isDemo && preview
+          ? ` <span class="pending-transcript mono">&ldquo;${escapeHtml(truncateAscii(preview, 64))}&rdquo;</span>`
+          : "";
       pendingBanner.hidden = false;
-      pendingBanner.innerHTML = `<span class="pill pill-accent">TELEGRAM DRAFT READY</span> To <strong>${escapeHtml(state.pendingReply.targetLabel)}</strong> &mdash; Press <strong>IMU Head Nod (N)</strong> or <strong>Tap (Enter)</strong> to send, or <strong>Shake (X)</strong> to cancel.`;
+      pendingBanner.classList.toggle("pending-banner-demo", isDemo);
+      pendingBanner.innerHTML = `<span class="pill pill-accent">TELEGRAM DRAFT READY</span> ${sourceBadge} To <strong>${escapeHtml(state.pendingReply.targetLabel)}</strong>${quote} &mdash; Press <strong>IMU Head Nod (N)</strong> or <strong>Tap (Enter)</strong> to send, or <strong>Shake (X)</strong> to cancel.`;
+    } else if (state.voiceRecording) {
+      const isDemo = state.voiceTranscriptSource === "DEMO_FALLBACK";
+      const sourceBadge = isDemo
+        ? `<span class="pill pill-demo-transcript" data-badge="demo-transcript">DEMO TRANSCRIPT</span>`
+        : `<span class="pill pill-live" data-badge="web-speech">WEB SPEECH</span>`;
+      const liveText = state.voiceTranscript
+        ? `<span class="pending-transcript mono">&ldquo;${escapeHtml(truncateAscii(state.voiceTranscript, 64))}&rdquo;</span>`
+        : isDemo
+          ? `Push-to-talk on-device demo fallback active &mdash; release mic to preview deterministic transcript.`
+          : `Browser Web Speech listening &mdash; release mic to draft (falls back to demo transcript if silent).`;
+      pendingBanner.hidden = false;
+      pendingBanner.classList.toggle("pending-banner-demo", isDemo);
+      pendingBanner.innerHTML = `<span class="pill pill-warn">MIC REC ${state.voiceSeconds || 0}s</span> ${sourceBadge} ${liveText}`;
     } else {
       pendingBanner.hidden = true;
+      pendingBanner.classList.remove("pending-banner-demo");
       pendingBanner.innerHTML = "";
+    }
+  }
+
+  const voiceModeBadge = document.getElementById("voice-fallback-badge");
+  if (voiceModeBadge) {
+    const usingDemoPath =
+      state.voiceTranscriptSource === "DEMO_FALLBACK" ||
+      state.pendingTrade?.transcriptSource === "DEMO_FALLBACK" ||
+      state.pendingReply?.transcriptSource === "DEMO_FALLBACK";
+    if (usingDemoPath || !hasBrowserSpeechSupport()) {
+      voiceModeBadge.innerHTML = `<span class="pill pill-demo-transcript" data-badge="demo-transcript">DEMO TRANSCRIPT</span>`;
+    } else {
+      voiceModeBadge.innerHTML = `<span class="pill pill-neutral">WEB SPEECH + DEMO FALLBACK</span>`;
     }
   }
 
@@ -1638,7 +1730,7 @@ function mountShell() {
             <h1>GlancePulse</h1>
             <span class="version-tag mono">v2.1 &middot; Even G2 Copilot</span>
           </div>
-          <p class="tagline">Voice-first Even Realities G2 copilot: live Hyperliquid wallet &amp; perps, Polymarket odds, hands-free paper execution (no private keys), and threaded Telegram replies with 4-bit sparklines &amp; IMU Head-Nod confirm.</p>
+          <p class="tagline">Glance at live positions, speak a command, nod once to confirm. Live Hyperliquid watch wallet &amp; perps, Polymarket odds, non-custodial paper tickets, and threaded Telegram replies on Even G2 (Web Speech in companion; push-to-talk demo transcripts on device).</p>
         </div>
         <div id="status-badges" class="badges"></div>
       </header>
@@ -1680,8 +1772,11 @@ function mountShell() {
 
             <div class="voice-demo-strip">
               <div class="voice-demo-head">
-                <span class="strip-label">1-Click Voice-to-1-Tap Demos (No Hardware Needed)</span>
-                <span class="mono meta-sub">PCM16 WAVEFORM &rarr; G2 TICKET &rarr; NOD / TAP</span>
+                <div class="voice-demo-title-row">
+                  <span class="strip-label">1-Click Voice-to-1-Tap Demos (No Hardware Needed)</span>
+                  <span id="voice-fallback-badge"></span>
+                </div>
+                <span class="mono meta-sub">BROWSER WEB SPEECH (COMPANION) &middot; PUSH-TO-TALK DEMO FALLBACK (G2)</span>
               </div>
               <div class="btn-row">
                 <button id="btn-voice-demo" class="btn btn-accent-soft">Voice: Telegram Reply</button>

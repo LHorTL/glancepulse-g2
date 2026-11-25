@@ -244,15 +244,18 @@ export function formatHeaderLine(state) {
 
   if (state.voiceRecording) {
     const role = String(state.voiceSpeakerRole || "self").toUpperCase().slice(0, 4);
-    return truncateAscii(`REC [${state.screen}] MIC:${role} ${hh}:${mm} ${batt}`, G2_TEXT_LIMITS.HEADER_CHARS);
+    const modeTag = state.voiceTranscriptSource === "DEMO_FALLBACK" ? "DEMO" : `MIC:${role}`;
+    return truncateAscii(`REC [${state.screen}] ${modeTag} ${hh}:${mm} ${batt}`, G2_TEXT_LIMITS.HEADER_CHARS);
   }
   if (state.pendingTrade) {
     const imuTag = state.imuActive ? "IMU:ON" : "CONFIRM";
-    return truncateAscii(`ORDER [${imuTag}] ${hh}:${mm} PAPER`, G2_TEXT_LIMITS.HEADER_CHARS);
+    const srcTag = state.pendingTrade.transcriptSource === "DEMO_FALLBACK" ? "PAPER/DEMO" : "PAPER";
+    return truncateAscii(`ORDER [${imuTag}] ${hh}:${mm} ${srcTag}`, G2_TEXT_LIMITS.HEADER_CHARS);
   }
   if (state.pendingReply) {
     const imuTag = state.imuActive ? "IMU:ON" : "CONFIRM";
-    return truncateAscii(`CONFIRM [${imuTag}] ${hh}:${mm} ${tg}`, G2_TEXT_LIMITS.HEADER_CHARS);
+    const srcTag = state.pendingReply.transcriptSource === "DEMO_FALLBACK" ? "DEMO" : tg;
+    return truncateAscii(`CONFIRM [${imuTag}] ${hh}:${mm} ${srcTag}`, G2_TEXT_LIMITS.HEADER_CHARS);
   }
   if (state.screen === "WALLET") {
     const netTag = state.hlNetwork === "testnet" ? "HL:TEST" : "HL:MAIN";

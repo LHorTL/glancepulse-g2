@@ -1,4 +1,6 @@
-# GlancePulse v2.1 — Voice-First Crypto, DeFi & Telegram Focus-Card Copilot for Even Realities G2
+# GlancePulse v2.1 — Crypto, DeFi & Telegram Focus-Card Copilot for Even Realities G2
+
+**Glance at live positions, speak a command, nod once to confirm.**
 
 Built for the **Heads Up: Even Realities Hackathon** targeting **Track 02 (Crypto & DeFi)**, **Track 01 (Messaging & News)**, **Special Prize (Best Telegram Integration)**, and **Grand Prize**.
 
@@ -8,8 +10,6 @@ Built for the **Heads Up: Even Realities Hackathon** targeting **Track 02 (Crypt
 
 ![GlancePulse G2 Optical Waveguide HUD](./assets/preview-hud.png)
 
-> *"Check a wallet balance, live odds or an open position; place a paper perp order or prediction bet — or reply to Telegram — by voice and confirm with one tap or a head nod."*
-
 ## What Makes GlancePulse v2.1 Different
 
 **GlancePulse v2.1** delivers complete **Read + Write loops** across both **Crypto & DeFi** and **Telegram Messaging** inside a single **4-Second Quiet-Tech Loop** on Even Realities G2 (`576×288` 4-bit monochrome green waveguide) paired with a clean minimal-white companion console:
@@ -17,9 +17,9 @@ Built for the **Heads Up: Even Realities Hackathon** targeting **Track 02 (Crypt
 1. **Live Hyperliquid Watch Wallet & Open Positions (Track 2 Read, Zero Custody / Zero Auth)**:
    - Queries public zero-auth Hyperliquid `clearinghouseState` across **Mainnet** (`api.hyperliquid.xyz/info`) and **Testnet** (`api.hyperliquid-testnet.xyz/info`).
    - Displays live account equity, margin ratio, unrealized PnL, and top open perp positions directly on the G2 `WALLET` screen and companion table — with a **1-Click Live Preset** active trader address plus any custom `0x...` address lookup.
-2. **Voice-to-1-Tap / IMU Head-Nod Paper Perp Orders & Polymarket Paper Bets (Track 2 Write, Zero Private Keys)**:
-   - Hold the R1 ring or temple touchpad (or click the **1-Click Voice Demo** buttons / command bar in the companion console) and speak commands such as `"Long BTC 100"`, `"Short ETH 250"`, or `"Bet Yes 50 on Fed"`.
-   - Previews the structured Order or Bet Ticket on the G2 lens (`≤ 26 chars × 3 lines` strict typography budget alongside the live 4-bit sparkline or probability gauge), then **Nod your head** (`IMU_DATA_REPORT`) or **1-Tap** to execute into the persistent local paper ledger — with **real-time mark-to-market uPnL** tracked against live Hyperliquid prices and live Polymarket odds — or **Shake** / double-tap to cancel cleanly.
+2. **Push-to-Talk Voice + 1-Tap / IMU Head-Nod Paper Perp Orders & Polymarket Paper Bets (Track 2 Write, Zero Private Keys)**:
+   - **Voice capture on G2 + browser-side Web Speech transcription in the companion; the on-device path ships with push-to-talk demo transcripts.** Whenever voice input uses the deterministic demo fallback path (on-device G2 WebView without Web Speech, silent mic release, or the **1-Click Voice Demo** buttons), the companion preview renders a clear **`DEMO TRANSCRIPT`** pill badge (and the G2 header tags `DEMO`) so live browser dictation is never confused with fallback presets.
+   - Hold the R1 ring or temple touchpad (or click the **1-Click Voice Demo** buttons / command bar in the companion console) with commands such as `"Long BTC 100"`, `"Short ETH 250"`, or `"Bet Yes 50 on Fed"`. Previews the structured Order or Bet Ticket on the G2 lens (`≤ 26 chars × 3 lines` strict typography budget alongside the live 4-bit sparkline or probability gauge), then **Nod your head** (`IMU_DATA_REPORT`) or **1-Tap** to execute into the persistent local paper ledger — with **real-time mark-to-market uPnL** tracked against live Hyperliquid prices and live Polymarket odds — or **Shake** / double-tap to cancel cleanly.
 3. **Heads-Up Telegram Focus Card + Threaded Voice Replies (Track 1 Read + Write)**:
    - Displays priority Telegram chats and channel posts (`getUpdates` with `offset = update_id + 1` and `allowed_updates=["message","channel_post"]`).
    - Auto-links mentioned assets and macro topics (`BTC`, `ETH`, `SOL`, `HYPE`, `SUI`, `ARB`, `Fed`, `FOMC`, `Polymarket`) to live Hyperliquid perps or Polymarket YES/NO odds, with context-aware smart replies and hands-free threaded voice replies (`reply_to_message_id`).
@@ -35,7 +35,7 @@ Built for the **Heads Up: Even Realities Hackathon** targeting **Track 02 (Crypt
 
 ```bash
 npm install
-npm test            # Run 21 unit tests (Hyperliquid wallet, paper trading, SDK validation, PNG, proto3, IMU, Telegram)
+npm test            # Run 22 unit tests (Hyperliquid wallet, paper trading, voice fallback, SDK validation, PNG, proto3, IMU, Telegram)
 npm run dev         # Launch browser G2 optical simulator & minimal-white companion console
 npm run build       # Production Vite bundle -> dist/
 npm run pack:g2     # Build EvenHub .ehpk package (v2.1.0)
@@ -64,7 +64,7 @@ npx @evenrealities/evenhub-simulator http://localhost:5173
 
 - `app.json` declares minimal permissions: `network` (`gamma-api.polymarket.com`, `api.hyperliquid.xyz`, `api.hyperliquid-testnet.xyz`, `api.telegram.org`) and `g2-microphone`.
 - **Zero private keys, zero wallet custody, zero hardcoded secrets** — Hyperliquid wallet lookups use public read-only `clearinghouseState`; paper orders/bets and optional Telegram Bot credentials persist strictly in EvenHub / browser local storage.
-- For standalone desktop browser Telegram testing outside Even App WebView (where Telegram Bot API omits CORS headers on JSON `POST`), deploy the included 45-line zero-secret [proxy/cloudflare-worker.js](./proxy/cloudflare-worker.js) and paste its URL into the optional **CORS Proxy URL** field.
+- For standalone desktop browser Telegram testing outside Even App WebView (where Telegram Bot API omits CORS headers on JSON `POST`), deploy the included 67-line zero-secret [proxy/cloudflare-worker.js](./proxy/cloudflare-worker.js) and paste its URL into the optional **CORS Proxy URL** field.
 
 ## License
 

@@ -939,4 +939,87 @@ test("21. Controller voice-trade -> IMU Head-Nod dynamically selects newly fille
   }
 });
 
+test("22. On-device push-to-talk fallback without Web Speech marks DEMO_FALLBACK honestly on trade & reply previews", async () => {
+  const st = getControllerState();
+  st.pendingTrade = null;
+  st.pendingReply = null;
+  st.voiceRecording = false;
+  st.voiceTranscript = "";
+  st.voiceTranscriptSource = "IDLE";
+
+  // 1) Push-to-talk on PERPS without browser Web Speech -> DEMO_FALLBACK paper order
+  st.screen = "PERPS";
+  st.selectedIndex = 0;
+  handleSdkEvent({
+    sysEvent: {
+      eventType: OsEventTypeList.LONG_PRESS_EVENT,
+      eventSource: EventSourceType.TOUCH_EVENT_FROM_RING,
+    },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(st.voiceRecording, true);
+  assert.equal(st.voiceTranscriptSource, "DEMO_FALLBACK");
+  const recHdr = buildHeaderUpgrade(st);
+  assert.ok(recHdr.content.includes("DEMO"), `Expected DEMO tag in recording header: ${recHdr.content}`);
+  assert.ok(recHdr.content.length <= G2_TEXT_LIMITS.HEADER_CHARS);
+
+  handleSdkEvent({
+    sysEvent: {
+      eventType: OsEventTypeList.LONG_PRESS_RELEASE_EVENT,
+      eventSource: EventSourceType.TOUCH_EVENT_FROM_RING,
+    },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(st.voiceRecording, false);
+  assert.equal(st.pendingTrade?.kind, "PAPER_PERP");
+  assert.equal(st.pendingTrade?.transcriptSource, "DEMO_FALLBACK");
+  const tradePage = buildG2PagePayload(st);
+  assert.equal(validateEvenHubPageContainer(tradePage).valid, true);
+  const tradeHdr = buildHeaderUpgrade(st);
+  assert.ok(tradeHdr.content.includes("PAPER/DEMO"), `Expected PAPER/DEMO header: ${tradeHdr.content}`);
+  assert.ok(tradeHdr.content.length <= G2_TEXT_LIMITS.HEADER_CHARS);
+
+  // Cancel trade resets transcript source to IDLE
+  handleSdkEvent({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(st.pendingTrade, null);
+  assert.equal(st.voiceTranscriptSource, "IDLE");
+
+  // 2) Push-to-talk on FOCUS without Web Speech -> DEMO_FALLBACK Telegram reply
+  st.screen = "FOCUS";
+  st.messageIndex = 0;
+  handleSdkEvent({
+    sysEvent: {
+      eventType: OsEventTypeList.LONG_PRESS_EVENT,
+      eventSource: EventSourceType.TOUCH_EVENT_FROM_GLASSES_R,
+    },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  handleSdkEvent({
+    sysEvent: {
+      eventType: OsEventTypeList.LONG_PRESS_RELEASE_EVENT,
+      eventSource: EventSourceType.TOUCH_EVENT_FROM_GLASSES_R,
+    },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(st.pendingReply?.transcriptSource, "DEMO_FALLBACK");
+  const replyHdr = buildHeaderUpgrade(st);
+  assert.ok(replyHdr.content.includes("DEMO"), `Expected DEMO tag in reply confirm header: ${replyHdr.content}`);
+  assert.ok(replyHdr.content.length <= G2_TEXT_LIMITS.HEADER_CHARS);
+
+  // 3) Typed command via submitVoiceCommandText is marked TYPED (not DEMO_FALLBACK)
+  await submitVoiceCommandText("Short ETH 250");
+  assert.equal(st.pendingTrade?.transcriptSource, "TYPED");
+  const typedHdr = buildHeaderUpgrade(st);
+  assert.ok(!typedHdr.content.includes("DEMO"), `Typed order should not show DEMO tag: ${typedHdr.content}`);
+
+  // Clean up
+  handleSdkEvent({ sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT } });
+  await new Promise((r) => setTimeout(r, 20));
+  if (st.toastTimer) {
+    clearTimeout(st.toastTimer);
+    st.toastTimer = null;
+  }
+});
+
 

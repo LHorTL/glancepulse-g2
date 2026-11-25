@@ -182,6 +182,13 @@ body {
   color: var(--ink-secondary);
 }
 
+.pill-demo-transcript {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-ink);
+  letter-spacing: 0.02em;
+}
+
 /* Main two-column flat layout separated by hairline */
 .layout-grid {
   display: grid;
@@ -310,6 +317,22 @@ body {
   display: none;
 }
 
+.pending-banner-demo {
+  background: var(--surface-subtle);
+  border-color: var(--warn-border);
+}
+
+.pending-transcript {
+  font-size: 11.5px;
+  color: var(--ink-secondary);
+  background: var(--bg-canvas);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 6px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 /* Flat Control & Voice Demo Strips */
 .control-strip {
   margin-top: 14px;
@@ -341,9 +364,16 @@ body {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+}
+
+.voice-demo-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
 .voice-demo-head .strip-label {

@@ -1,7 +1,7 @@
 {
   "name": "glancepulse-g2",
   "version": "2.1.0",
-  "description": "GlancePulse — Voice-First Crypto, DeFi & Telegram Focus-Card Copilot for Even Realities G2 smart glasses",
+  "description": "GlancePulse — Crypto, DeFi & Telegram Focus-Card Copilot for Even Realities G2 smart glasses",
   "type": "module",
   "scripts": {
     "dev": "vite",
